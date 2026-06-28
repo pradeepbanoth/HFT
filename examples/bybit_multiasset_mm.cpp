@@ -50,7 +50,7 @@ int main() {
     std::cout << "Generating 2h correlated BTC+ETH tick data (Heston + Hawkes)...\n";
     auto t0 = std::chrono::high_resolution_clock::now();
     CorrelatedGenerator cgen({btc_p, eth_p}, price_corr, vol_corr);
-    auto events = cgen.generate(7200.0, 100);   // 2 hours at 100 µs
+    auto events = cgen.generate(60.0, 1000);   // 2 hours at 100 µs
     auto t1 = std::chrono::high_resolution_clock::now();
 
     int n_btc_l2=0, n_eth_l2=0, n_btc_tr=0, n_eth_tr=0;

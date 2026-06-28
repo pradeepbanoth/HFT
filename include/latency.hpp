@@ -103,6 +103,10 @@ public:
 
     const LatencyProfile& profile() const noexcept { return cfg_; }
 
+    // Raw sample vectors (for latency histograms in analytics)
+    const std::vector<int64_t>& raw_feed_samples()  const { return feed_samples_; }
+    const std::vector<int64_t>& raw_order_samples() const { return order_samples_; }
+
 private:
     LatencyProfile             cfg_;
     std::mt19937_64            rng_;

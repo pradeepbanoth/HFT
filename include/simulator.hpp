@@ -191,30 +191,22 @@ public:
     SimStats run(EventRange&& events) {
         safe_call([this]{ strategy_.on_start(*this); });
 
-        auto wall_start = std::chrono::high_resolution_clock::now();
-        int64_t next_snap = 0;
-        int64_t tick_count = 0;
+        wall_start_ns_ = std::chrono::high_resolution_clock::now();
+        next_snap_  = 0;
+        tick_count_ = 0;
 
         for (auto& raw_event : events) {
-            ++tick_count;
+            ++tick_count_;
             int64_t ts = event_timestamp(raw_event);
             current_ts_ = ts;
 
-            // ① Drain order queue
             drain_order_queue(ts);
-
-            // ② Apply to book (exchange-side, no latency)
             apply_market_event(raw_event, ts);
-
-            // ③ Schedule delayed feed delivery
             int64_t feed_at = ts + latency_.feed_delay();
             schedule_feed(raw_event, feed_at);
-
-            // ④ Drain feed queue up to now
             drain_feed_queue(ts);
 
-            // ⑤ Periodic snapshot + risk check
-            if (ts >= next_snap) {
+            if (ts >= next_snap_) {
                 auto mids = collect_mids();
                 portfolio_.snapshot(ts, mids);
 
@@ -228,11 +220,10 @@ public:
                         }
                     }
                 }
-                next_snap = ts + snapshot_interval_ns_;
+                next_snap_ = ts + snapshot_interval_ns_;
             }
         }
 
-        // Final flush
         int64_t flush_ts = current_ts_ + 1'000'000'000'000LL;
         drain_order_queue(flush_ts);
         drain_feed_queue(flush_ts);
@@ -240,13 +231,12 @@ public:
         safe_call([this]{ strategy_.on_end(*this); });
 
         auto wall_end = std::chrono::high_resolution_clock::now();
-        double elapsed = std::chrono::duration<double>(wall_end - wall_start).count();
+        double elapsed = std::chrono::duration<double>(wall_end - wall_start_ns_).count();
 
-        // Assemble stats
         SimStats s;
-        s.ticks_processed   = tick_count;
+        s.ticks_processed   = tick_count_;
         s.wall_time_s       = elapsed;
-        s.ticks_per_second  = elapsed > 0.0 ? tick_count / elapsed : 0.0;
+        s.ticks_per_second  = elapsed > 0.0 ? tick_count_ / elapsed : 0.0;
         s.total_fills       = static_cast<int64_t>(fill_history_.size());
         s.maker_fills       = 0; s.taker_fills = 0;
         for (auto& f : fill_history_) {
@@ -261,7 +251,79 @@ public:
         return s;
     }
 
-    // ── Accessors for strategy callbacks ─────────────────────────────────────
+    // ── Manual-drive API (for live replay) ───────────────────────────────────
+    // Use these instead of run() when driving the engine event-by-event from
+    // an external source (e.g., a live WebSocket feed thread).
+
+    void on_start_manual() {
+        wall_start_ns_ = std::chrono::high_resolution_clock::now();
+        next_snap_     = 0;
+        tick_count_    = 0;
+        safe_call([this]{ strategy_.on_start(*this); });
+    }
+
+    void process_one(const MarketEvent& raw_event) {
+        ++tick_count_;
+        int64_t ts  = event_timestamp(raw_event);
+        current_ts_ = ts;
+
+        drain_order_queue(ts);
+        apply_market_event(raw_event, ts);
+        int64_t feed_at = ts + latency_.feed_delay();
+        schedule_feed(raw_event, feed_at);
+        drain_feed_queue(ts);
+
+        if (ts >= next_snap_) {
+            auto mids = collect_mids();
+            portfolio_.snapshot(ts, mids);
+            if (!portfolio_.halted()) {
+                auto breaches = portfolio_.check_risk(mids);
+                if (!breaches.empty()) {
+                    safe_call([&]{ strategy_.on_risk_breach(breaches, ts, *this); });
+                    if (portfolio_.limits().halt_on_breach) {
+                        portfolio_.set_halted(true);
+                        cancel_all();
+                    }
+                }
+            }
+            next_snap_ = ts + snapshot_interval_ns_;
+        }
+    }
+
+    SimStats on_end_manual() {
+        int64_t flush_ts = current_ts_ + 1'000'000'000'000LL;
+        drain_order_queue(flush_ts);
+        drain_feed_queue(flush_ts);
+        safe_call([this]{ strategy_.on_end(*this); });
+
+        auto wall_end = std::chrono::high_resolution_clock::now();
+        double elapsed = std::chrono::duration<double>(wall_end - wall_start_ns_).count();
+
+        SimStats s;
+        s.ticks_processed   = tick_count_;
+        s.wall_time_s       = elapsed;
+        s.ticks_per_second  = elapsed > 0.0 ? tick_count_ / elapsed : 0.0;
+        s.total_fills       = static_cast<int64_t>(fill_history_.size());
+        s.maker_fills       = 0; s.taker_fills = 0;
+        for (auto& f : fill_history_) {
+            if (f.is_maker) ++s.maker_fills; else ++s.taker_fills;
+        }
+        s.strategy_errors   = strategy_errors_;
+        s.open_orders_final = static_cast<int64_t>(open_orders_.size());
+        s.halted            = portfolio_.halted();
+        s.portfolio_summary = portfolio_.summary();
+        s.feed_latency      = latency_.feed_percentiles();
+        s.order_latency     = latency_.order_percentiles();
+        return s;
+    }
+
+    // Expose raw PnL series for analytics
+    const std::vector<std::pair<int64_t,double>>& pnl_series() const {
+        return portfolio_.pnl_series();
+    }
+
+    // Expose fill history for analytics
+    const std::vector<FillEvent>& fill_history() const { return fill_history_; }
 
     OrderBook*       get_book(const std::string& sym) {
         auto it = books_.find(sym);
@@ -271,12 +333,14 @@ public:
     PortfolioState&  portfolio()    noexcept { return portfolio_; }
     int64_t          current_ts()   const noexcept { return current_ts_; }
 
+    // Raw latency samples for analytics histograms
+    const std::vector<int64_t>& latency_raw_feed()  const { return latency_.raw_feed_samples();  }
+    const std::vector<int64_t>& latency_raw_order() const { return latency_.raw_order_samples(); }
+
     // Direct read access to open orders (for strategy inspection)
     const std::unordered_map<std::string, Order>& open_orders() const {
         return open_orders_;
     }
-
-    const std::vector<FillEvent>& fill_history() const { return fill_history_; }
 
 private:
     Strategy&           strategy_;
@@ -292,9 +356,14 @@ private:
     TimedEventQueue feed_queue_;
     TimedEventQueue order_queue_;
 
-    int64_t current_ts_      = 0;
-    int64_t order_id_counter_= 0;
-    int64_t strategy_errors_ = 0;
+    int64_t current_ts_       = 0;
+    int64_t order_id_counter_ = 0;
+    int64_t strategy_errors_  = 0;
+
+    // Manual-drive state (also used internally by run())
+    std::chrono::high_resolution_clock::time_point wall_start_ns_;
+    int64_t next_snap_   = 0;
+    int64_t tick_count_  = 0;
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 

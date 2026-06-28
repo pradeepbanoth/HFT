@@ -63,7 +63,6 @@ public:
         bool is_buy      = (order.side == Side::Buy);
 
         auto levels = is_buy ? book.ask_depth(200) : book.bid_depth(200);
-        double total_notional = 0.0;
         bool fok_fail = false;
 
         if (order.order_type == OrderType::FOK) {
@@ -107,7 +106,7 @@ public:
                 fills.push_back(std::move(fe));
 
                 remaining       -= fill_qty;
-                total_notional  += notional;
+                
             }
         }
 

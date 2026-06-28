@@ -165,7 +165,7 @@ void test_latency() {
     CHECK(fp.n == 2000, "feed sample count");
     CHECK(op.n == 2000, "order sample count");
     CHECK(fp.p50 > 0, "feed p50 > 0");
-    CHECK(op.p99 > op.p50 * 1.5, "order p99 > 1.5 × p50 (heavy tail)");
+    CHECK(op.p99 > op.p50 * 1.5, "order p99 > 1.5x p50 (heavy tail)");
     std::cout << "  Feed  p50=" << std::fixed << std::setprecision(1) << fp.p50
               << "µs  p99=" << fp.p99 << "µs\n";
     std::cout << "  Order p50=" << op.p50 << "µs  p99=" << op.p99 << "µs\n";
@@ -693,7 +693,7 @@ void test_parsers() {
     CHECK(agg_evts.size() == 1, "aggTrade parses to 1 event");
     const Trade* agg_trade = std::get_if<Trade>(&agg_evts[0]);
     CHECK(agg_trade != nullptr, "aggTrade is Trade type");
-    CHECK(agg_trade->aggressor == Side::Buy, "aggTrade m=false → buy aggressor");
+    CHECK(agg_trade->aggressor == Side::Buy, "aggTrade m=false -> buy aggressor");
 
     // trade — m=true → seller is aggressor
     const char* trade_json = R"({
@@ -702,7 +702,7 @@ void test_parsers() {
     })";
     auto trade_evts = bp.parse(trade_json);
     const Trade* tr = std::get_if<Trade>(&trade_evts[0]);
-    CHECK(tr && tr->aggressor == Side::Sell, "trade m=true → sell aggressor");
+    CHECK(tr && tr->aggressor == Side::Sell, "trade m=true -> sell aggressor");
 
     // ── Bybit parser ───────────────────────────────────────────────────────
 
@@ -777,10 +777,10 @@ void test_timed_queue() {
 // ─────────────────────────────────────────────────────────────────────────────
 
 int main() {
-    std::cout << "╔══════════════════════════════════════════════════╗\n";
-    std::cout << "║   HFT C++ Backtesting Framework — Test Suite     ║\n";
-    std::cout << "╚══════════════════════════════════════════════════╝\n";
-
+    std::cout << "==================================================\n";
+    std::cout << " HFT C++ Backtesting Framework - Test Suite\n";
+    std::cout << "==================================================\n";
+   
     test_price_level();
     test_orderbook();
     test_latency();
@@ -793,13 +793,13 @@ int main() {
     test_simulation_pipeline();
     test_market_maker();
 
-    std::cout << "\n══════════════════════════════════════════════════\n";
-    std::cout << "  Results: " << g_pass << " passed, " << g_fail << " failed\n";
+    std::cout << "\n==================================================\n";
+    std::cout << " Results: " << g_pass << " passed, " << g_fail << " failed\n";
     if (g_fail == 0)
-        std::cout << "  ✓ ALL TESTS PASSED\n";
+    std::cout << " ALL TESTS PASSED\n";
     else
-        std::cout << "  ✗ " << g_fail << " FAILURES\n";
-    std::cout << "══════════════════════════════════════════════════\n";
+    std::cout << " " << g_fail << " FAILURES\n";
+    std::cout << "==================================================\n";
 
     return g_fail > 0 ? 1 : 0;
 }

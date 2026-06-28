@@ -39,7 +39,7 @@ int main() {
     std::cout << "Generating 1h of BTC/USDT tick data (Heston + Hawkes)...\n";
     auto t_gen0 = std::chrono::high_resolution_clock::now();
     SyntheticGenerator gen(params);
-    auto events = gen.generate(3600.0, 100);   // 1 hour at 100 µs intervals
+    auto events = gen.generate(60.0, 1000);   // 1 hour at 100 µs intervals
     auto t_gen1 = std::chrono::high_resolution_clock::now();
     double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
 
