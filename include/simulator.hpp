@@ -11,6 +11,7 @@
 //  • std::variant event payloads — no heap allocation per event in hot path
 // ─────────────────────────────────────────────────────────────────────────────
 
+#include "risk_gateway.hpp"
 #include "types.hpp"
 #include "orderbook.hpp"
 #include "latency.hpp"
@@ -96,6 +97,7 @@ struct SimStats {
 class SimEngine {
 public:
     SimEngine(
+        
         Strategy&          strategy,
         LatencyProfile     latency_profile,
         FillModelConfig    fill_cfg         = {},
@@ -120,6 +122,10 @@ public:
             std::make_unique<OrderBook>(symbol, tick_size, check_integrity));
     }
 
+    void set_risk_gateway(RiskGateway* gateway) noexcept {
+    risk_gateway_ = gateway;
+     }
+
     // ── Order Management API ─────────────────────────────────────────────────
 
     std::string submit_limit(const std::string& symbol,
@@ -137,6 +143,29 @@ public:
         order.timestamp  = current_ts_;
         order.order_type = post_only ? OrderType::PostOnly : OrderType::Limit;
         order.client_id  = client_id;
+
+        if (risk_gateway_) {
+    auto* book = get_book(symbol);
+    RiskDecision rd = risk_gateway_->check_order(
+        order,
+        portfolio_,
+        open_orders_,
+        book,
+        current_ts_
+    );
+
+    if (!rd.allowed) {
+        order.status = OrderStatus::Rejected;
+        order_history_.push_back(order);
+
+        order_queue_.push(
+            current_ts_,
+            OrderAckEvt{std::move(order), false}
+        );
+
+        return oid;
+    }
+}
 
         int64_t deliver_at = current_ts_ + latency_.order_rtt() / 2;
         order_queue_.push(deliver_at, OrderAckEvt{std::move(order), true});
@@ -157,6 +186,29 @@ public:
         order.timestamp  = current_ts_;
         order.order_type = OrderType::Market;
         order.client_id  = client_id;
+
+        if (risk_gateway_) {
+    auto* book = get_book(symbol);
+    RiskDecision rd = risk_gateway_->check_order(
+        order,
+        portfolio_,
+        open_orders_,
+        book,
+        current_ts_
+    );
+
+    if (!rd.allowed) {
+        order.status = OrderStatus::Rejected;
+        order_history_.push_back(order);
+
+        order_queue_.push(
+            current_ts_,
+            OrderAckEvt{std::move(order), false}
+        );
+
+        return oid;
+    }
+}
 
         int64_t deliver_at = current_ts_ + latency_.order_rtt() / 2;
         order_queue_.push(deliver_at, OrderAckEvt{std::move(order), true});
@@ -353,6 +405,7 @@ private:
     std::unordered_map<std::string, Order>                      open_orders_;
     std::vector<FillEvent>                                      fill_history_;
 
+    RiskGateway* risk_gateway_ = nullptr;
     TimedEventQueue feed_queue_;
     TimedEventQueue order_queue_;
 

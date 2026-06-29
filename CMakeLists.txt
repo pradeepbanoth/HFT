@@ -45,16 +45,19 @@ endfunction()
 # ── Tests ─────────────────────────────────────────────────────────────────────
 hft_executable(test_all       tests/test_all.cpp)
 hft_executable(test_advanced  tests/test_advanced.cpp)
+hft_executable(test_modules   tests/test_modules.cpp)
 
 # ── Examples ──────────────────────────────────────────────────────────────────
 hft_executable(binance_btc_mm       examples/binance_btc_mm.cpp)
 hft_executable(bybit_multiasset_mm  examples/bybit_multiasset_mm.cpp)
 hft_executable(optimize_and_analyze examples/optimize_and_analyze.cpp)
+hft_executable(production_workflow  examples/production_workflow.cpp)
 
 # ── CTest ─────────────────────────────────────────────────────────────────────
 enable_testing()
 add_test(NAME CoreTests     COMMAND test_all)
 add_test(NAME AdvancedTests COMMAND test_advanced)
+add_test(NAME ModuleTests   COMMAND test_modules)
 
 # ── Install ───────────────────────────────────────────────────────────────────
 install(DIRECTORY include/ DESTINATION include/hft)

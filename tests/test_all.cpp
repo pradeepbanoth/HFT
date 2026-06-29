@@ -8,6 +8,7 @@
 #include <cmath>
 #include <iomanip>
 #include <chrono>
+#include <cstdio>
 
 using namespace hft;
 using namespace hft::signals;
@@ -416,6 +417,115 @@ void test_portfolio() {
     CHECK_NEAR(summary.realized_pnl.at("BTCUSDT"), 0.8*2000.0, 1e-4, "Cumulative realized PnL");
 }
 
+
+
+void test_risk_gateway() {
+    SUITE("RiskGateway");
+
+    GlobalRiskLimits global;
+    global.max_open_orders = 10;
+    global.max_gross_exposure = 100000.0;
+    global.max_net_exposure = 100000.0;
+
+    RiskGateway rg(global);
+
+    SymbolRiskLimits lim;
+    lim.max_position = 1.0;
+    lim.max_order_qty = 0.5;
+    lim.max_order_notional = 50000.0;
+    lim.max_price_deviation_bps = 100.0;
+    lim.min_price = 1.0;
+    lim.max_price = 100000.0;
+    lim.tick_size = 0.01;
+    lim.lot_size = 0.001;
+    lim.max_orders_per_second = 2;
+
+    rg.set_symbol_limits("BTCUSDT", lim);
+
+    PortfolioState pf(100000.0);
+    OrderBook book("BTCUSDT", 0.01);
+
+    book.apply_l2(L2Update{"BTCUSDT", BookSide::Bid, 100.0, 1.0, 1000, 1});
+    book.apply_l2(L2Update{"BTCUSDT", BookSide::Ask, 101.0, 1.0, 1001, 2});
+
+    std::unordered_map<std::string, Order> open;
+
+    Order ok;
+    ok.order_id = "o1";
+    ok.symbol = "BTCUSDT";
+    ok.side = Side::Buy;
+    ok.price = 99.50;
+    ok.qty = 0.1;
+    ok.order_type = OrderType::PostOnly;
+
+    auto d1 = rg.check_order(ok, pf, open, &book, 1'000'000'000LL);
+    CHECK(d1.allowed, "Valid post-only order accepted");
+
+    Order too_big = ok;
+    too_big.qty = 2.0;
+    auto d2 = rg.check_order(too_big, pf, open, &book, 1'100'000'000LL);
+    CHECK(!d2.allowed && d2.code == RiskRejectCode::MaxOrderQty, "Max order qty rejected");
+
+    Order crossing = ok;
+    crossing.price = 101.0;
+    auto d3 = rg.check_order(crossing, pf, open, &book, 1'200'000'000LL);
+    CHECK(!d3.allowed && d3.code == RiskRejectCode::PostOnlyWouldCross, "Post-only crossing rejected");
+
+    rg.set_kill_switch(true);
+    auto d4 = rg.check_order(ok, pf, open, &book, 2'000'000'000LL);
+    CHECK(!d4.allowed && d4.code == RiskRejectCode::KillSwitchActive, "Kill switch rejects order");
+
+    rg.set_kill_switch(false);
+
+    Order bad_tick = ok;
+    bad_tick.price = 99.505;
+    auto d5 = rg.check_order(bad_tick, pf, open, &book, 3'000'000'000LL);
+    CHECK(!d5.allowed && d5.code == RiskRejectCode::InvalidPrice, "Off-tick price rejected");
+
+    CHECK(rg.stats().checks >= 5, "RiskGateway stats checks updated");
+    CHECK(rg.stats().rejected >= 4, "RiskGateway stats rejects updated");
+}
+
+
+
+void test_risk_manager() {
+    SUITE("RiskManager");
+
+    RiskManagerConfig cfg;
+    cfg.max_order_notional_usd = 1000.0;
+    cfg.max_orders_per_second = 2;
+    cfg.max_daily_loss_usd = 100.0;
+    cfg.max_position_qty["BTCUSDT"] = 1.0;
+
+    RiskManager rm(cfg);
+
+    auto v1 = rm.check_order("BTCUSDT", Side::Buy, 100.0, 5.0, 1000);
+    CHECK(v1.empty(), "Normal order passes");
+
+    auto v2 = rm.check_order("BTCUSDT", Side::Buy, 1000.0, 5.0, 2000);
+    CHECK(!v2.empty(), "Fat-finger order rejected");
+
+    rm.on_order_sent("BTCUSDT", 100.0, 0.1, 1'000'000'000);
+    rm.on_order_sent("BTCUSDT", 100.0, 0.1, 1'000'000'100);
+
+    auto v3 = rm.check_order("BTCUSDT", Side::Buy, 100.0, 0.1, 1'000'000'200);
+    CHECK(!v3.empty(), "Order rate limit works");
+
+    FillEvent loss;
+    loss.order_id = "x";
+    loss.symbol = "BTCUSDT";
+    loss.side = Side::Sell;
+    loss.price = 100.0;
+    loss.qty = 0.1;
+    loss.timestamp = 2'000'000'000;
+    loss.realized_pnl = -150.0;
+    loss.fee = 0.0;
+
+    auto cb = rm.on_fill(loss, 10000.0, loss.timestamp);
+    CHECK(!cb.empty(), "Daily loss circuit breaker triggered");
+    CHECK(rm.is_halted(), "RiskManager halted after loss breach");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 7. Full simulation pipeline
 // ─────────────────────────────────────────────────────────────────────────────
@@ -501,6 +611,37 @@ void test_simulation_pipeline() {
               << "  Order p99=" << stats.order_latency.p99 << "µs\n";
 }
 
+
+void test_profiler() {
+    SUITE("Profiler");
+
+    Profiler prof;
+
+    {
+        auto t = prof.scoped("section_a");
+       volatile int x = 0;
+       for (int i = 0; i < 1000; ++i) x += i;
+        (void)x;
+    }
+
+    {
+        auto t = prof.scoped("section_b");
+        volatile int x = 0;
+        for (int i = 0; i < 500; ++i) x += i;
+         (void)x;
+    }
+
+    CHECK(prof.section_count() == 2, "Profiler captured 2 sections");
+
+    auto* a = prof.get("section_a");
+    CHECK(a != nullptr, "section_a exists");
+    CHECK(a && a->count == 1, "section_a count = 1");
+    CHECK(a && a->mean_ns() > 0, "section_a mean > 0");
+
+    std::string csv = prof.to_csv();
+    CHECK(csv.find("section_a") != std::string::npos, "Profiler CSV contains section_a");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 8. GLFT Market Maker strategy
 // ─────────────────────────────────────────────────────────────────────────────
@@ -569,6 +710,64 @@ void test_market_maker() {
     std::cout << "  Max DD: " << stats.portfolio_summary.max_drawdown * 100.0 << "%\n";
     std::cout << "  Halted: " << (stats.halted ? "YES" : "no") << "\n";
 }
+
+void test_event_source() {
+    SUITE("EventSource");
+
+    constexpr int64_t TS = 1'700'000'000'000'000'000LL;
+
+    std::vector<MarketEvent> events;
+    events.push_back(L2Update{"BTCUSDT", BookSide::Ask, 101.0, 1.0, TS + 2, 2});
+    events.push_back(L2Update{"BTCUSDT", BookSide::Bid, 100.0, 1.0, TS + 1, 1});
+    events.push_back(Trade{"t1", "BTCUSDT", Side::Buy, 101.0, 0.1, TS + 3, Side::Buy, false});
+
+    VectorEventSource source(std::move(events), true);
+
+    MarketEvent e1, e2, e3;
+    CHECK(source.next(e1), "VectorEventSource next 1");
+    CHECK(source.next(e2), "VectorEventSource next 2");
+    CHECK(source.next(e3), "VectorEventSource next 3");
+    CHECK(!source.next(e3), "VectorEventSource exhausted");
+
+    CHECK(event_timestamp(e1) <= event_timestamp(e2), "Events sorted 1");
+    CHECK(event_timestamp(e2) <= event_timestamp(e3), "Events sorted 2");
+
+    source.reset();
+    CHECK(source.next(e1), "VectorEventSource reset works");
+}
+
+
+
+void test_config() {
+    SUITE("Config");
+
+    Config cfg;
+    cfg.load_string(R"(
+[strategy]
+symbol = BTCUSDT
+as_gamma = 0.15
+use_glft = true
+
+[risk]
+max_drawdown = 0.08
+max_pos_BTCUSDT = 0.25
+
+[latency]
+preset = binance_colo
+)");
+
+    CHECK(cfg.get_string("strategy.symbol") == "BTCUSDT", "Config string getter");
+    CHECK_NEAR(cfg.get_double("strategy.as_gamma"), 0.15, 1e-12, "Config double getter");
+    CHECK(cfg.get_bool("strategy.use_glft"), "Config bool getter");
+
+    auto risk = cfg.to_risk_limits("risk");
+    CHECK_NEAR(risk.max_drawdown, 0.08, 1e-12, "RiskLimits builder");
+    CHECK_NEAR(risk.max_position["BTCUSDT"], 0.25, 1e-12, "Risk position limit parsed");
+
+    auto lat = cfg.to_latency_profile("latency");
+    CHECK(lat.feed_base > 0, "Latency preset builder");
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 9. Synthetic data generator
@@ -771,6 +970,142 @@ void test_timed_queue() {
     CHECK(ready2.size() == 2, "pop_ready(300) gives 2 events");
     CHECK(q.empty(), "Queue empty after all pops");
 }
+
+void test_event_recorder() {
+    SUITE("EventRecorder");
+
+    std::string path = "test_events.hftrec";
+
+    {
+        EventRecorder rec(path);
+        rec.write(L2Update{"BTCUSDT", BookSide::Bid, 100.0, 1.5, 1000, 1});
+        rec.write(L2Update{"BTCUSDT", BookSide::Ask, 101.0, 2.0, 1001, 2});
+        rec.write(Trade{"t1", "BTCUSDT", Side::Buy, 101.0, 0.1, 1002, Side::Buy, false});
+        CHECK(rec.count() == 3, "Recorder wrote 3 events");
+    }
+
+    EventReplayReader reader(path);
+
+    MarketEvent e;
+    CHECK(reader.next(e), "Replay event 1");
+    CHECK(std::holds_alternative<L2Update>(e), "Replay event 1 is L2");
+
+    CHECK(reader.next(e), "Replay event 2");
+    CHECK(std::holds_alternative<L2Update>(e), "Replay event 2 is L2");
+
+    CHECK(reader.next(e), "Replay event 3");
+    CHECK(std::holds_alternative<Trade>(e), "Replay event 3 is Trade");
+
+    CHECK(!reader.next(e), "Replay exhausted");
+
+    std::remove(path.c_str());
+}
+
+
+
+void test_oms() {
+    SUITE("OrderManager");
+
+    OrderManager oms;
+
+    Order o;
+    o.order_id = "o1";
+    o.client_id = "c1";
+    o.symbol = "BTCUSDT";
+    o.side = Side::Buy;
+    o.price = 100.0;
+    o.qty = 1.0;
+    o.timestamp = 1000;
+
+    CHECK(oms.submit(o), "Submit order");
+    CHECK(oms.live_count("BTCUSDT") == 1, "Live count after submit");
+
+    CHECK(oms.on_ack(o, true, 1100), "ACK accepted");
+    CHECK(oms.is_live("o1"), "Order is live");
+
+    FillEvent f;
+    f.order_id = "o1";
+    f.symbol = "BTCUSDT";
+    f.side = Side::Buy;
+    f.price = 100.0;
+    f.qty = 0.4;
+    f.timestamp = 1200;
+
+    CHECK(oms.on_fill(f), "Partial fill accepted");
+    CHECK(oms.get("o1")->status == OrderStatus::Partial, "Status partial");
+
+    f.qty = 0.6;
+    f.timestamp = 1300;
+    CHECK(oms.on_fill(f), "Final fill accepted");
+    CHECK(oms.get("o1")->status == OrderStatus::Filled, "Status filled");
+    CHECK(oms.live_count("BTCUSDT") == 0, "Live count after filled");
+
+    CHECK(!oms.on_fill(f), "Duplicate/terminal fill rejected");
+
+    auto cid = oms.order_by_client_id("c1");
+    CHECK(cid.has_value() && *cid == "o1", "Client ID lookup works");
+
+    CHECK(!oms.audit_log().empty(), "Audit log populated");
+}
+
+
+void test_execution_engine() {
+    SUITE("ExecutionEngine");
+
+    OrderBook book("BTCUSDT", 0.01);
+    constexpr int64_t TS = 1'700'000'000'000'000'000LL;
+
+    book.apply_l2({"BTCUSDT", BookSide::Bid, 100.0, 5.0, TS, 1});
+    book.apply_l2({"BTCUSDT", BookSide::Ask, 101.0, 5.0, TS, 2});
+
+    ExecutionEngine exec;
+
+    ExecConfig cfg;
+    cfg.parent_id = "parent1";
+    cfg.symbol = "BTCUSDT";
+    cfg.side = Side::Buy;
+    cfg.algo = ExecAlgo::TWAP;
+    cfg.total_qty = 1.0;
+    cfg.min_child_qty = 0.1;
+    cfg.max_child_qty = 0.25;
+    cfg.start_ts = TS;
+    cfg.end_ts = TS + 10'000'000'000LL;
+    cfg.slice_interval_ns = 1'000'000'000LL;
+    cfg.post_only = true;
+
+    CHECK(exec.add_parent(cfg), "Add parent execution order");
+    CHECK(exec.start("parent1", TS), "Start parent order");
+
+    std::unordered_map<std::string, OrderBook*> books;
+    books["BTCUSDT"] = &book;
+
+    MarketContext ctx;
+    ctx.ts = TS + 1'000'000'000LL;
+    ctx.recent_market_volume = 10.0;
+
+    auto children = exec.on_timer(ctx, books);
+    CHECK(children.size() == 1, "TWAP generated one child order");
+    CHECK(children[0].qty > 0.0, "Child qty positive");
+    CHECK(children[0].price == 100.0, "Post-only buy uses best bid");
+
+    exec.on_child_ack(children[0].client_id, true);
+
+    FillEvent fill;
+    fill.order_id = children[0].client_id;
+    fill.symbol = "BTCUSDT";
+    fill.side = Side::Buy;
+    fill.price = children[0].price;
+    fill.qty = children[0].qty;
+    fill.timestamp = ctx.ts + 1000;
+
+    exec.on_fill(fill);
+
+    auto report = exec.report("parent1");
+    CHECK(report.has_value(), "Execution report exists");
+    CHECK(report->filled_qty > 0.0, "Execution filled qty tracked");
+    CHECK(report->child_count == 1, "Child count tracked");
+}
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // main

@@ -84,6 +84,8 @@ public:
     PriceLevel& operator=(const PriceLevel&) = delete;
     PriceLevel(PriceLevel&&)                 = default;
 
+
+    
     // ── Mutations ────────────────────────────────────────────────────────────
 
     void add_order(const std::string& order_id, double qty) {
@@ -206,6 +208,24 @@ private:
 // ─────────────────────────────────────────────────────────────────────────────
 class OrderBook {
 public:
+        void clear() {
+    bids_.clear();
+    asks_.clear();
+
+    bid_levels_.clear();
+    ask_levels_.clear();
+
+    last_update_ts_ = 0;
+    sequence_ = 0;
+    cross_events_ = 0;
+    total_buy_vol_ = 0.0;
+    total_sell_vol_ = 0.0;
+
+    trade_head_ = 0;
+    trade_count_ = 0;
+
+    std::fill(trade_ring_.begin(), trade_ring_.end(), Trade{});
+}
     // Bids: descending by price (highest first)
     using BidMap = std::map<double, double, std::greater<double>>;
     // Asks: ascending by price (lowest first)
@@ -229,6 +249,8 @@ public:
     OrderBook(const OrderBook&)            = delete;
     OrderBook& operator=(const OrderBook&) = delete;
 
+
+    
     // ── L2 Feed ──────────────────────────────────────────────────────────────
 
     void apply_l2(const L2Update& upd) {
@@ -454,6 +476,22 @@ public:
         for (auto it = asks_.begin(); it != asks_.end() && out.size() < n; ++it)
             out.push_back({it->first, it->second});
         return out;
+    }
+
+    double total_bid_qty(size_t levels = 10) const noexcept {
+    double s = 0.0;
+    size_t n = 0;
+    for (auto it = bids_.begin(); it != bids_.end() && n < levels; ++it, ++n)
+        s += it->second;
+    return s;
+     }
+
+    double total_ask_qty(size_t levels = 10) const noexcept {
+    double s = 0.0;
+    size_t n = 0;
+    for (auto it = asks_.begin(); it != asks_.end() && n < levels; ++it, ++n)
+        s += it->second;
+    return s;
     }
 
     double imbalance(size_t levels = 5) const noexcept {
