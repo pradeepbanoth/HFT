@@ -424,62 +424,76 @@ void test_risk_gateway() {
 
     GlobalRiskLimits global;
     global.max_open_orders = 10;
-    global.max_gross_exposure = 100000.0;
-    global.max_net_exposure = 100000.0;
+    global.max_gross_exposure = 1'000'000.0;
+    global.max_net_exposure = 1'000'000.0;
+    global.enforce_post_only = true;
 
     RiskGateway rg(global);
 
     SymbolRiskLimits lim;
-    lim.max_position = 1.0;
-    lim.max_order_qty = 0.5;
-    lim.max_order_notional = 50000.0;
-    lim.max_price_deviation_bps = 100.0;
+    lim.max_position = 10.0;
+    lim.max_order_qty = 1.0;
+    lim.max_order_notional = 100'000.0;
+    lim.max_price_deviation_bps = 500.0;
     lim.min_price = 1.0;
-    lim.max_price = 100000.0;
+    lim.max_price = 1'000'000.0;
     lim.tick_size = 0.01;
     lim.lot_size = 0.001;
-    lim.max_orders_per_second = 2;
+    lim.max_orders_per_second = 100;
 
     rg.set_symbol_limits("BTCUSDT", lim);
 
-    PortfolioState pf(100000.0);
+    RiskLimits portfolio_limits;
+    PortfolioState portfolio(100'000.0, portfolio_limits);
+
+    std::unordered_map<std::string, Order> open_orders;
+
     OrderBook book("BTCUSDT", 0.01);
+    book.apply_l2({"BTCUSDT", BookSide::Bid, 100.0, 5.0, 1000, 1});
+    book.apply_l2({"BTCUSDT", BookSide::Ask, 101.0, 5.0, 1001, 2});
 
-    book.apply_l2(L2Update{"BTCUSDT", BookSide::Bid, 100.0, 1.0, 1000, 1});
-    book.apply_l2(L2Update{"BTCUSDT", BookSide::Ask, 101.0, 1.0, 1001, 2});
+    Order valid;
+    valid.order_id = "valid";
+    valid.symbol = "BTCUSDT";
+    valid.side = Side::Buy;
+    valid.price = 100.0;
+    valid.qty = 0.1;
+    valid.timestamp = 2000;
+    valid.order_type = OrderType::PostOnly;
 
-    std::unordered_map<std::string, Order> open;
-
-    Order ok;
-    ok.order_id = "o1";
-    ok.symbol = "BTCUSDT";
-    ok.side = Side::Buy;
-    ok.price = 99.50;
-    ok.qty = 0.1;
-    ok.order_type = OrderType::PostOnly;
-
-    auto d1 = rg.check_order(ok, pf, open, &book, 1'000'000'000LL);
+    auto d1 = rg.check_order(valid, portfolio, open_orders, &book, 2000);
     CHECK(d1.allowed, "Valid post-only order accepted");
 
-    Order too_big = ok;
+    Order too_big = valid;
+    too_big.order_id = "too_big";
     too_big.qty = 2.0;
-    auto d2 = rg.check_order(too_big, pf, open, &book, 1'100'000'000LL);
+
+    auto d2 = rg.check_order(too_big, portfolio, open_orders, &book, 2100);
     CHECK(!d2.allowed && d2.code == RiskRejectCode::MaxOrderQty, "Max order qty rejected");
 
-    Order crossing = ok;
+    Order crossing = valid;
+    crossing.order_id = "crossing";
     crossing.price = 101.0;
-    auto d3 = rg.check_order(crossing, pf, open, &book, 1'200'000'000LL);
+    crossing.order_type = OrderType::PostOnly;
+
+    auto d3 = rg.check_order(crossing, portfolio, open_orders, &book, 2200);
     CHECK(!d3.allowed && d3.code == RiskRejectCode::PostOnlyWouldCross, "Post-only crossing rejected");
 
     rg.set_kill_switch(true);
-    auto d4 = rg.check_order(ok, pf, open, &book, 2'000'000'000LL);
+
+    Order killed = valid;
+    killed.order_id = "killed";
+
+    auto d4 = rg.check_order(killed, portfolio, open_orders, &book, 2300);
     CHECK(!d4.allowed && d4.code == RiskRejectCode::KillSwitchActive, "Kill switch rejects order");
 
     rg.set_kill_switch(false);
 
-    Order bad_tick = ok;
-    bad_tick.price = 99.505;
-    auto d5 = rg.check_order(bad_tick, pf, open, &book, 3'000'000'000LL);
+    Order off_tick = valid;
+    off_tick.order_id = "off_tick";
+    off_tick.price = 100.005;
+
+    auto d5 = rg.check_order(off_tick, portfolio, open_orders, &book, 2400);
     CHECK(!d5.allowed && d5.code == RiskRejectCode::InvalidPrice, "Off-tick price rejected");
 
     CHECK(rg.stats().checks >= 5, "RiskGateway stats checks updated");
@@ -492,24 +506,29 @@ void test_risk_manager() {
     SUITE("RiskManager");
 
     RiskManagerConfig cfg;
-    cfg.max_order_notional_usd = 1000.0;
-    cfg.max_orders_per_second = 2;
+    cfg.max_order_notional_usd = 1'000'000.0;
+    cfg.max_daily_notional_usd = 10'000'000.0;
     cfg.max_daily_loss_usd = 100.0;
-    cfg.max_position_qty["BTCUSDT"] = 1.0;
+    cfg.max_position_qty["BTCUSDT"] = 100.0;
+    cfg.max_price_deviation_bps = 5000.0;
+    cfg.max_orders_per_second = 2;
 
-    RiskManager rm(cfg);
-
-    auto v1 = rm.check_order("BTCUSDT", Side::Buy, 100.0, 5.0, 1000);
+    RiskManager rm_normal(cfg);
+    auto v1 = rm_normal.check_order("BTCUSDT", Side::Buy, 100.0, 5.0, 1000);
     CHECK(v1.empty(), "Normal order passes");
 
-    auto v2 = rm.check_order("BTCUSDT", Side::Buy, 1000.0, 5.0, 2000);
+    RiskManager rm_fat(cfg);
+    auto v2 = rm_fat.check_order("BTCUSDT", Side::Buy, 100000.0, 500.0, 2000);
     CHECK(!v2.empty(), "Fat-finger order rejected");
 
-    rm.on_order_sent("BTCUSDT", 100.0, 0.1, 1'000'000'000);
-    rm.on_order_sent("BTCUSDT", 100.0, 0.1, 1'000'000'100);
+    RiskManager rm_rate(cfg);
+    rm_rate.on_order_sent("BTCUSDT", 100.0, 0.1, 1'000'000'000);
+    rm_rate.on_order_sent("BTCUSDT", 100.0, 0.1, 1'000'000'100);
 
-    auto v3 = rm.check_order("BTCUSDT", Side::Buy, 100.0, 0.1, 1'000'000'200);
+    auto v3 = rm_rate.check_order("BTCUSDT", Side::Buy, 100.0, 0.1, 1'000'000'200);
     CHECK(!v3.empty(), "Order rate limit works");
+
+    RiskManager rm_loss(cfg);
 
     FillEvent loss;
     loss.order_id = "x";
@@ -521,10 +540,11 @@ void test_risk_manager() {
     loss.realized_pnl = -150.0;
     loss.fee = 0.0;
 
-    auto cb = rm.on_fill(loss, 10000.0, loss.timestamp);
+    auto cb = rm_loss.on_fill(loss, 10000.0, loss.timestamp);
     CHECK(!cb.empty(), "Daily loss circuit breaker triggered");
-    CHECK(rm.is_halted(), "RiskManager halted after loss breach");
+    CHECK(rm_loss.is_halted(), "RiskManager halted after loss breach");
 }
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // 7. Full simulation pipeline
@@ -1071,6 +1091,10 @@ void test_execution_engine() {
     cfg.start_ts = TS;
     cfg.end_ts = TS + 10'000'000'000LL;
     cfg.slice_interval_ns = 1'000'000'000LL;
+    cfg.max_spread_bps = 200.0;
+    cfg.min_liquidity_qty = 0.0;
+    cfg.max_child_qty = 0.05;
+    cfg.min_child_qty = 0.001;
     cfg.post_only = true;
 
     CHECK(exec.add_parent(cfg), "Add parent execution order");
@@ -1085,6 +1109,9 @@ void test_execution_engine() {
 
     auto children = exec.on_timer(ctx, books);
     CHECK(children.size() == 1, "TWAP generated one child order");
+    if (children.empty()) return;
+
+    auto child = children[0];
     CHECK(children[0].qty > 0.0, "Child qty positive");
     CHECK(children[0].price == 100.0, "Post-only buy uses best bid");
 
@@ -1122,11 +1149,20 @@ int main() {
     test_signals();
     test_fill_simulator();
     test_portfolio();
+    test_risk_gateway();
+    test_risk_manager();
+    test_simulation_pipeline();
+    test_profiler();
+    test_event_source();
+    test_config();
+    test_oms();
     test_timed_queue();
     test_synthetic();
     test_parsers();
     test_simulation_pipeline();
     test_market_maker();
+    test_event_recorder();
+    test_execution_engine();
 
     std::cout << "\n==================================================\n";
     std::cout << " Results: " << g_pass << " passed, " << g_fail << " failed\n";

@@ -343,6 +343,106 @@ void test_profiler() {
     }
 }
 
+
+
+void test_portfolio_risk_engine() {
+    SUITE("PortfolioRiskEngine");
+
+    RiskLimits base_limits;
+    PortfolioState portfolio(100000.0, base_limits);
+
+    FillEvent buy_btc;
+    buy_btc.order_id = "f1";
+    buy_btc.symbol = "BTCUSDT";
+    buy_btc.side = Side::Buy;
+    buy_btc.price = 50000.0;
+    buy_btc.qty = 0.5;
+    buy_btc.timestamp = 1000;
+    portfolio.update_on_fill(buy_btc);
+
+    FillEvent buy_eth;
+    buy_eth.order_id = "f2";
+    buy_eth.symbol = "ETHUSDT";
+    buy_eth.side = Side::Buy;
+    buy_eth.price = 2500.0;
+    buy_eth.qty = 5.0;
+    buy_eth.timestamp = 2000;
+    portfolio.update_on_fill(buy_eth);
+
+    std::unordered_map<std::string, double> prices;
+    prices["BTCUSDT"] = 51000.0;
+    prices["ETHUSDT"] = 2600.0;
+
+    portfolio.snapshot(3000, prices);
+
+    PortfolioRiskLimits limits;
+    limits.max_gross_exposure = 1000000.0;
+    limits.max_net_exposure = 1000000.0;
+    limits.max_leverage = 5.0;
+    limits.max_var_95 = 100000.0;
+    limits.max_cvar_95 = 150000.0;
+    limits.max_mc_var_99 = 200000.0;
+    limits.max_margin_usage = 0.90;
+    limits.max_concentration = 0.80;
+    limits.max_drawdown = 0.30;
+    limits.max_liquidity_days = 10.0;
+    limits.max_stress_loss_frac = 0.30;
+
+    PortfolioRiskEngine engine(limits, 42);
+
+    engine.set_asset_input({"BTCUSDT", 51000.0, 0.04, 1000000000.0, 0.10, 0.10});
+    engine.set_asset_input({"ETHUSDT", 2600.0, 0.05, 800000000.0, 0.12, 0.10});
+    engine.set_correlation("BTCUSDT", "ETHUSDT", 0.75);
+
+    engine.add_scenario({
+        "crypto_crash",
+        {
+            {"BTCUSDT", -0.20},
+            {"ETHUSDT", -0.30}
+        }
+    });
+
+    engine.add_factor({
+        "crypto_beta",
+        {
+            {"BTCUSDT", 1.0},
+            {"ETHUSDT", 1.2}
+        }
+    });
+
+    auto report = engine.evaluate(portfolio, prices, 1000);
+
+    CHECK(report.equity > 0.0, "Risk report equity positive");
+    CHECK(report.gross_exposure > 0.0, "Gross exposure positive");
+    CHECK(report.net_exposure > 0.0, "Net exposure positive");
+    CHECK(report.leverage >= 0.0, "Leverage non-negative");
+
+    CHECK(report.parametric_var_95 > 0.0, "Parametric VaR positive");
+    CHECK(report.parametric_cvar_95 >= report.parametric_var_95, "CVaR >= VaR");
+    CHECK(report.monte_carlo_var_99 >= 0.0, "Monte Carlo VaR non-negative");
+
+    CHECK(report.margin_required > 0.0, "Margin required positive");
+    CHECK(report.margin_usage >= 0.0, "Margin usage non-negative");
+
+    CHECK(report.max_concentration > 0.0, "Concentration computed");
+    CHECK(!report.max_concentration_symbol.empty(), "Concentration symbol set");
+
+    CHECK(report.liquidity_days >= 0.0, "Liquidity days non-negative");
+    CHECK(report.worst_stress_loss > 0.0, "Stress loss positive");
+    CHECK(report.worst_stress_name == "crypto_crash", "Worst stress scenario selected");
+
+    CHECK(report.factor_exposures.count("crypto_beta") == 1, "Factor exposure computed");
+    CHECK(!report.contributions.empty(), "Risk contributions computed");
+
+    std::cout << "  Equity      : $" << report.equity << "\n";
+    std::cout << "  Gross exp   : $" << report.gross_exposure << "\n";
+    std::cout << "  VaR 95      : $" << report.parametric_var_95 << "\n";
+    std::cout << "  MC VaR 99   : $" << report.monte_carlo_var_99 << "\n";
+    std::cout << "  Stress loss : $" << report.worst_stress_loss << "\n";
+}
+
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 4. Config system
 // ─────────────────────────────────────────────────────────────────────────────
@@ -851,6 +951,566 @@ void test_oms_reconciler() {
     CHECK(csv.find("filled_qty_mismatch") != std::string::npos, "CSV includes mismatch reason");
 }
 
+
+void test_paper_exchange() {
+    SUITE("PaperExchange");
+
+    PaperExchange ex("paper");
+    int state_changes = 0;
+    int md_events = 0;
+    int reports = 0;
+
+    ex.set_state_callback([&](ExchangeConnectionState) {
+        ++state_changes;
+    });
+
+    ex.set_market_data_callback([&](const MarketEvent&) {
+        ++md_events;
+    });
+
+    ex.set_execution_report_callback([&](const ExchangeExecutionReport&) {
+        ++reports;
+    });
+
+    CHECK(ex.connect(), "PaperExchange connect");
+    CHECK(ex.state() == ExchangeConnectionState::Connected, "Exchange connected");
+    CHECK(state_changes >= 1, "State callback fired");
+
+    ExchangeSymbolInfo info;
+    info.symbol = "BTCUSDT";
+    info.base = "BTC";
+    info.quote = "USDT";
+    info.tick_size = 0.01;
+    info.lot_size = 0.001;
+    ex.add_symbol(info);
+
+    auto si = ex.symbol_info("BTCUSDT");
+    CHECK(si.has_value(), "symbol_info exists");
+    CHECK_NEAR(si->tick_size, 0.01, 1e-12, "tick_size stored");
+
+    CHECK(ex.subscribe_book("BTCUSDT", 20), "subscribe_book works");
+    CHECK(ex.subscribe_trades("BTCUSDT"), "subscribe_trades works");
+
+    L2Update upd;
+    upd.symbol = "BTCUSDT";
+    upd.side = BookSide::Bid;
+    upd.price = 100.0;
+    upd.qty = 1.0;
+    upd.timestamp = 1000;
+
+    ex.inject_market_event(upd);
+    CHECK(md_events == 1, "Market data callback fired");
+
+    ExchangeOrderRequest req;
+    req.client_id = "c1";
+    req.symbol = "BTCUSDT";
+    req.side = Side::Buy;
+    req.type = OrderType::Limit;
+    req.price = 99.0;
+    req.qty = 0.01;
+    req.post_only = true;
+
+    auto ack = ex.submit_order(req);
+    CHECK(ack.accepted, "submit_order accepted");
+    CHECK(ex.open_orders("BTCUSDT").size() == 1, "Open order stored");
+    CHECK(reports >= 1, "Execution report emitted");
+
+    ExchangeReplaceRequest rr;
+    rr.order_id = ack.order_id;
+    rr.symbol = "BTCUSDT";
+    rr.new_price = 98.5;
+    rr.new_qty = 0.02;
+
+    auto rack = ex.replace_order(rr);
+    CHECK(rack.accepted, "replace_order accepted");
+
+    ExchangeCancelRequest cr;
+    cr.order_id = ack.order_id;
+    cr.symbol = "BTCUSDT";
+
+    auto cack = ex.cancel_order(cr);
+    CHECK(cack.accepted, "cancel_order accepted");
+    CHECK(ex.open_orders("BTCUSDT").empty(), "Open order removed after cancel");
+
+    ex.disconnect();
+    CHECK(ex.state() == ExchangeConnectionState::Disconnected, "Exchange disconnected");
+}
+
+
+void test_session_manager() {
+    SUITE("SessionManager");
+
+    SessionConfig cfg;
+    cfg.venue = "binance";
+    cfg.require_tls = true;
+    cfg.require_auth = true;
+    cfg.heartbeat_interval_ns = 1'000'000'000LL;
+    cfg.stale_timeout_ns = 3'000'000'000LL;
+    cfg.reconnect_base_delay_ns = 1'000'000'000LL;
+    cfg.reconnect_max_delay_ns = 8'000'000'000LL;
+    cfg.max_reconnects = 3;
+
+    SessionManager sm(cfg);
+
+    int events = 0;
+    sm.set_callback([&](const SessionEvent&) {
+        ++events;
+    });
+
+    sm.add_subscription({"book", "BTCUSDT", 50});
+    sm.add_subscription({"trades", "BTCUSDT", 0});
+    sm.add_subscription({"book", "BTCUSDT", 50}); // duplicate should not add
+
+    CHECK(sm.subscriptions().size() == 2, "Duplicate subscription ignored");
+
+    int64_t t = 1'000'000'000LL;
+
+    CHECK(sm.connect(t), "Connect requested");
+    CHECK(sm.state() == SessionState::Connecting, "State = Connecting");
+
+    CHECK(sm.on_tcp_connected(t + 100), "TCP connected");
+    CHECK(sm.state() == SessionState::TcpConnected, "State = TcpConnected");
+
+    CHECK(sm.on_tls_ready(t + 200), "TLS ready");
+    CHECK(sm.state() == SessionState::Authenticating, "State = Authenticating");
+
+    CHECK(sm.on_authenticated(t + 300, t + 10'000'000'000LL), "Authenticated");
+    CHECK(sm.state() == SessionState::Live, "State = Live after resubscribe");
+
+    CHECK(sm.stats().subscriptions_sent == 2, "Subscriptions sent");
+
+    CHECK(sm.should_send_heartbeat(t + 1'000'000'500LL), "Should send heartbeat");
+    sm.on_heartbeat_sent(t + 1'000'000'500LL);
+    sm.on_heartbeat_received(t + 1'000'500'500LL);
+
+    CHECK(sm.stats().heartbeats_sent == 1, "Heartbeat sent counted");
+    CHECK(sm.stats().heartbeats_received == 1, "Heartbeat received counted");
+    CHECK(sm.stats().avg_heartbeat_rtt_us > 0.0, "Heartbeat RTT tracked");
+
+    CHECK(sm.on_sequence("BTCUSDT.book", 1) == SessionEventType::Live, "Seq 1 OK");
+    CHECK(sm.on_sequence("BTCUSDT.book", 2) == SessionEventType::Live, "Seq 2 OK");
+    CHECK(sm.on_sequence("BTCUSDT.book", 4) == SessionEventType::SequenceGap, "Sequence gap detected");
+    CHECK(sm.stats().sequence_gaps == 1, "Sequence gap counted");
+
+    CHECK(sm.on_sequence("BTCUSDT.book", 4) == SessionEventType::DuplicateSequence, "Duplicate sequence detected");
+    CHECK(sm.stats().duplicates == 1, "Duplicate counted");
+
+    CHECK(sm.on_sequence("BTCUSDT.book", 3) == SessionEventType::OutOfOrderSequence, "Out-of-order sequence detected");
+    CHECK(sm.stats().out_of_order == 1, "Out-of-order counted");
+
+    CHECK(sm.check_stale(t + 5'000'000'000LL), "Stale detected");
+    CHECK(sm.state() == SessionState::Reconnecting, "State = Reconnecting after stale");
+
+    CHECK(!sm.should_reconnect_now(t + 5'000'000'100LL), "Reconnect not due immediately");
+
+    sm.begin_reconnect(t + 20'000'000'000LL);
+    CHECK(sm.state() == SessionState::Connecting, "Begin reconnect moves to Connecting");
+
+    CHECK(sm.on_tcp_connected(t + 20'000'000'100LL), "Reconnect TCP connected");
+    CHECK(sm.on_tls_ready(t + 20'000'000'200LL), "Reconnect TLS ready");
+    CHECK(sm.on_authenticated(t + 20'000'000'300LL, t + 40'000'000'000LL), "Reconnect authenticated");
+
+    CHECK(sm.state() == SessionState::Live, "Recovered to Live");
+    CHECK(sm.stats().successful_reconnects >= 1, "Successful reconnect counted");
+    CHECK(sm.stats().subscriptions_restored == 2, "Subscriptions restored");
+
+    CHECK(sm.check_auth_expiry(t + 39'500'000'000LL), "Auth expiry detected");
+    CHECK(sm.state() == SessionState::Authenticating, "State = Authenticating after auth expiry");
+
+    auto health = sm.health();
+    CHECK(health.score >= 0.0 && health.score <= 1.0, "Health score in [0,1]");
+    CHECK(!sm.event_history().empty(), "Event history populated");
+    CHECK(events > 0, "Callback fired");
+}
+
+
+
+void test_rest_client() {
+    SUITE("RestClient");
+
+    MockRestTransport transport;
+    int calls = 0;
+
+    transport.set_handler([&](const std::string& base, const RestRequest& req) {
+        ++calls;
+
+        RestResponse r;
+        r.request_id = req.request_id;
+
+        if (req.path == "/retry" && calls < 2) {
+            r.status = 500;
+            r.error = RestErrorCode::ServerError;
+            r.body = R"({"error":"temporary"})";
+            return r;
+        }
+
+        if (req.path == "/signed") {
+            CHECK(req.headers.count("X-Signature") == 1, "Signed request has signature header");
+        }
+
+        if (req.path == "/ids") {
+            CHECK(req.headers.count("X-Request-Id") == 1, "Request ID header added");
+            CHECK(req.headers.count("Idempotency-Key") == 1, "Idempotency key added");
+        }
+
+        r.status = 200;
+        r.error = RestErrorCode::None;
+        r.body = R"({"ok":true})";
+        return r;
+    });
+
+    RestClientConfig cfg;
+    cfg.retry.policy = RetryPolicy::SafeOnly;
+    cfg.retry.max_attempts = 3;
+    cfg.retry.base_backoff_ms = 1;
+    cfg.retry.max_backoff_ms = 2;
+    cfg.default_rate_limit.requests_per_second = 1000;
+    cfg.default_rate_limit.burst = 1000;
+
+    RestSigner signer([](RestRequest& req) {
+        req.headers["X-Signature"] = "mock-signature";
+    });
+
+    RestClient client("https://api.test", transport, cfg, signer);
+
+    auto r1 = client.get("/ping");
+    CHECK(r1.ok(), "GET /ping succeeds");
+    CHECK(r1.status == 200, "GET status 200");
+
+    calls = 0;
+    auto r2 = client.get("/retry");
+    CHECK(r2.ok(), "GET /retry succeeds after retry");
+    CHECK(r2.attempts == 2, "Retry used 2 attempts");
+    CHECK(client.stats().retries >= 1, "Retry counter incremented");
+
+    auto r3 = client.get("/signed", {}, true);
+    CHECK(r3.ok(), "Signed GET succeeds");
+
+    auto r4 = client.post("/ids", R"({"x":1})", false, true);
+    CHECK(r4.ok(), "Idempotent POST succeeds");
+
+    CHECK(client.stats().requests >= 4, "Stats requests counted");
+    CHECK(client.stats().success >= 4, "Stats success counted");
+    CHECK(client.stats().avg_latency_us >= 0.0, "Latency stat valid");
+}
+
+
+void test_exchange_adapter() {
+    SUITE("ExchangeAdapter");
+
+    PaperExchange ex("paper");
+    ex.add_symbol({"BTCUSDT", "BTC", "USDT", 0.01, 0.001, 0.001, 10.0, 100.0});
+
+    PaperExchangeAdapter adapter(ex);
+    adapter.add_symbol_mapping("BTCUSDT", "BTC-USDT");
+
+    int md_count = 0;
+    int er_count = 0;
+    int err_count = 0;
+
+    adapter.set_market_callback([&](const MarketEvent& e) {
+        ++md_count;
+        CHECK(std::holds_alternative<L2Update>(e), "Market event is L2Update");
+        CHECK(std::get<L2Update>(e).symbol == "BTCUSDT", "Market symbol normalized to internal");
+    });
+
+    adapter.set_execution_callback([&](const ExchangeExecutionReport& r) {
+        ++er_count;
+        CHECK(r.symbol == "BTCUSDT", "Execution report symbol normalized");
+    });
+
+    adapter.set_error_callback([&](const AdapterErrorEvent& err) {
+        ++err_count;
+        CHECK(err.error != ExchangeErrorCode::None, "Adapter error callback receives error");
+    });
+
+    CHECK(adapter.connect(), "Adapter connects");
+
+    bool book_sub = adapter.subscribe_orderbook("BTCUSDT", 20);
+    bool trade_sub = adapter.subscribe_trades("BTCUSDT");
+
+    CHECK(book_sub, "Subscribe orderbook");
+    CHECK(trade_sub, "Subscribe trades");
+
+    L2Update upd;
+    upd.symbol = "BTC-USDT";
+    upd.side = BookSide::Bid;
+    upd.price = 100.0;
+    upd.qty = 1.0;
+    upd.timestamp = 1000;
+    ex.inject_market_event(upd);
+
+    CHECK(md_count == 1, "Market callback fired once");
+
+    ExchangeOrderRequest req;
+    req.client_id = "cid-1";
+    req.symbol = "BTCUSDT";
+    req.side = Side::Buy;
+    req.type = OrderType::Limit;
+    req.price = 100.0;
+    req.qty = 0.01;
+    req.post_only = true;
+
+    auto result = adapter.submit_order(req);
+    CHECK(result.ok, "Adapter order accepted");
+    CHECK(er_count >= 1, "Execution report fired for order ACK");
+
+    auto open = adapter.open_orders("BTCUSDT");
+    CHECK(!open.empty(), "Adapter open_orders non-empty");
+    CHECK(open[0].symbol == "BTCUSDT", "Open order symbol normalized internal");
+
+    auto dup = adapter.submit_order(req);
+    CHECK(!dup.ok, "Duplicate client id rejected");
+    CHECK(dup.error == ExchangeErrorCode::DuplicateOrder, "Duplicate mapped to DuplicateOrder");
+    CHECK(err_count >= 1, "Error callback fired");
+
+    ExchangeReplaceRequest rep;
+    rep.order_id = result.ack.order_id;
+    rep.client_id = req.client_id;
+    rep.symbol = "BTCUSDT";
+    rep.new_price = 100.01;
+    rep.new_qty = 0.02;
+
+    auto rep_result = adapter.replace_order(rep);
+    CHECK(rep_result.ok, "Adapter replace accepted");
+
+    ExchangeCancelRequest cancel;
+    cancel.order_id = result.ack.order_id;
+    cancel.client_id = req.client_id;
+    cancel.symbol = "BTCUSDT";
+
+    auto cancel_result = adapter.cancel_order(cancel);
+    CHECK(cancel_result.ok, "Adapter cancel accepted");
+
+    CHECK(adapter.to_external_symbol("BTCUSDT") == "BTC-USDT", "Symbol to external");
+    CHECK(adapter.to_internal_symbol("BTC-USDT") == "BTCUSDT", "Symbol to internal");
+
+    auto metrics = adapter.metrics();
+    CHECK(metrics.submitted_orders >= 2, "Metrics submitted_orders updated");
+    CHECK(metrics.cancelled_orders >= 1, "Metrics cancelled_orders updated");
+    CHECK(metrics.replaced_orders >= 1, "Metrics replaced_orders updated");
+
+    CHECK(adapter.translate_error("429", "rate limit") == ExchangeErrorCode::RateLimited, "Error translation rate limit");
+    CHECK(adapter.translate_error("-2011", "unknown order") == ExchangeErrorCode::OrderNotFound, "Venue code translation");
+}
+
+void test_websocket_engine() {
+    SUITE("WebSocketEngine");
+
+    MockWebSocketTransport transport;
+
+    WsConfig cfg;
+    cfg.ping_interval_ns = 1;
+    cfg.stale_timeout_ns = 1'000'000'000LL;
+    cfg.max_outbound_queue = 4;
+
+    WebSocketEngine ws(transport, cfg);
+
+    int messages = 0;
+    int errors = 0;
+    int events = 0;
+
+    ws.set_message_callback([&](const WsMessage& msg) {
+        if (msg.type == WsMessageType::Text && msg.payload == "hello")
+            ++messages;
+    });
+
+    ws.set_error_callback([&](const std::string&) {
+        ++errors;
+    });
+
+    ws.set_event_callback([&](const WsEvent&) {
+        ++events;
+    });
+
+    CHECK(ws.connect("wss://mock.exchange/ws"), "WebSocket connects");
+    CHECK(ws.state() == WsState::Connected, "WebSocket state connected");
+    CHECK(transport.url() == "wss://mock.exchange/ws", "URL stored");
+
+    CHECK(ws.send_text("subscribe"), "send_text succeeds");
+    CHECK(!transport.sent().empty(), "Transport captured outgoing message");
+
+    transport.inject({WsMessageType::Text, "hello", 0});
+    ws.poll_once();
+
+    CHECK(messages == 1, "Text message callback fired");
+    CHECK(ws.stats().messages_in >= 1, "messages_in updated");
+
+    transport.inject({WsMessageType::Ping, "abc", 0});
+    ws.poll_once();
+
+    CHECK(ws.stats().pings_in == 1, "Ping counted");
+    CHECK(ws.stats().pongs_out >= 1, "Auto pong sent");
+
+    CHECK(ws.add_subscription("book:BTCUSDT", "{\"op\":\"sub\",\"ch\":\"book\"}"), "Subscription added");
+    CHECK(ws.subscriptions().count("book:BTCUSDT") == 1, "Subscription stored");
+
+    CHECK(ws.remove_subscription("book:BTCUSDT"), "Subscription removed");
+    CHECK(ws.subscriptions().count("book:BTCUSDT") == 0, "Subscription erased");
+
+    ws.disconnect();
+    CHECK(ws.state() == WsState::Disconnected, "WebSocket disconnected");
+
+    CHECK(ws.send_text("queued-msg"), "Send while disconnected queues message");
+    CHECK(ws.reconnect(), "Reconnect succeeds");
+    CHECK(ws.state() == WsState::Connected, "State connected after reconnect");
+
+    bool found_queued = false;
+    for (const auto& m : transport.sent()) {
+        if (m.payload == "queued-msg") found_queued = true;
+    }
+    CHECK(found_queued, "Queued outbound message flushed after reconnect");
+
+    CHECK(events > 0, "Event callback fired");
+    CHECK(errors == 0, "No unexpected errors");
+}
+
+
+void test_binance_adapter() {
+    SUITE("BinanceAdapter");
+
+    OrderManager oms;
+    PortfolioState portfolio(100000.0);
+
+    RiskGateway risk;
+    SymbolRiskLimits limits;
+    limits.max_position = 10.0;
+    limits.max_order_qty = 5.0;
+    limits.max_order_notional = 500000.0;
+    limits.tick_size = 0.01;
+    limits.lot_size = 0.001;
+    limits.max_orders_per_second = 100;
+    risk.set_symbol_limits("BTCUSDT", limits);
+
+    PaperExchangeGateway gateway("binance", &oms, &risk, &portfolio);
+
+    OrderBook book("BTCUSDT", 0.01);
+    book.apply_l2({"BTCUSDT", BookSide::Bid, 100.0, 5.0, 1, 1});
+    book.apply_l2({"BTCUSDT", BookSide::Ask, 101.0, 5.0, 2, 2});
+    gateway.update_book("BTCUSDT", &book);
+
+    BinanceAdapterConfig cfg;
+    cfg.mode = AdapterMode::Paper;
+    cfg.max_orders_per_second = 100;
+    BinanceAdapter adapter(cfg, &gateway, &oms);
+
+    BinanceSymbolFilter filter;
+    filter.symbol = "BTCUSDT";
+    filter.tick_size = 0.01;
+    filter.lot_size = 0.001;
+    filter.min_qty = 0.001;
+    filter.max_qty = 10.0;
+    filter.min_notional = 1.0;
+    adapter.set_symbol_filter(filter);
+
+    int book_cb = 0;
+    int trade_cb = 0;
+    int ack_cb = 0;
+    int fill_cb = 0;
+    int cancel_cb = 0;
+    int err_cb = 0;
+
+    AdapterCallbacks cb;
+    cb.on_book = [&](const L2Update& u) {
+        ++book_cb;
+        CHECK(u.symbol == "BTCUSDT", "Book callback symbol normalized");
+    };
+    cb.on_trade = [&](const Trade& t) {
+        ++trade_cb;
+        CHECK(t.symbol == "BTCUSDT", "Trade callback symbol normalized");
+    };
+    cb.on_ack = [&](const Order&, bool accepted) {
+        ++ack_cb;
+        CHECK(accepted || ack_cb > 1, "ACK callback fired");
+    };
+    cb.on_fill = [&](const FillEvent& f) {
+        ++fill_cb;
+        CHECK(f.symbol == "BTCUSDT", "Fill callback symbol normalized");
+    };
+    cb.on_cancel = [&](const std::string&) {
+        ++cancel_cb;
+    };
+    cb.on_error = [&](const AdapterErrorEvent& err) {
+        ++err_cb;
+        CHECK(err.error != ExchangeErrorCode::None, "Binance adapter error callback receives error");
+    };
+    adapter.set_callbacks(cb);
+
+    CHECK(adapter.connect(), "Adapter connects");
+    CHECK(adapter.is_connected(), "Adapter state connected");
+    CHECK(adapter.authenticated(), "Adapter authenticated in paper mode");
+
+    CHECK(adapter.subscribe_orderbook("btc-usdt", 20), "Subscribe orderbook");
+    CHECK(adapter.subscribe_trades("BTC/USDT"), "Subscribe trades");
+    CHECK(adapter.subscribe_ticker("btcusdt"), "Subscribe ticker");
+
+    adapter.inject_book_update({"btc-usdt", BookSide::Bid, 100.0, 1.0, 10, 10});
+    CHECK(book_cb == 1, "Book callback fired once");
+
+    adapter.inject_trade({"t1", "btc/usdt", Side::Buy, 101.0, 0.1, 11, Side::Buy, false});
+    CHECK(trade_cb == 1, "Trade callback fired once");
+
+    Order o;
+    o.order_id = "o1";
+    o.client_id = "c1";
+    o.symbol = "btc-usdt";
+    o.side = Side::Buy;
+    o.price = 100.0;
+    o.qty = 0.01;
+    o.timestamp = 12;
+    o.order_type = OrderType::PostOnly;
+
+    auto ack = adapter.submit_order(o);
+    CHECK(ack.accepted, "Adapter order accepted");
+    CHECK(ack.order_id == "o1", "ACK order id preserved");
+    CHECK(ack_cb >= 1, "ACK callback fired");
+    CHECK(!adapter.open_orders("BTCUSDT").empty(), "Adapter open_orders non-empty");
+
+    Order dup = o;
+    dup.order_id = "o2";
+    dup.client_id = "c1";
+    auto dup_ack = adapter.submit_order(dup);
+    CHECK(!dup_ack.accepted, "Duplicate client id rejected");
+    CHECK(err_cb >= 1, "Error callback fired for duplicate");
+
+    FillEvent f;
+    f.order_id = "o1";
+    f.symbol = "btc-usdt";
+    f.side = Side::Buy;
+    f.price = 100.0;
+    f.qty = 0.01;
+    f.timestamp = 13;
+    f.is_maker = true;
+
+    adapter.inject_fill(f);
+    CHECK(fill_cb == 1, "Fill callback fired once");
+    CHECK(adapter.fills().size() == 1, "Adapter stores fill");
+
+    auto rep = adapter.replace_order("o1", 99.99, 0.01);
+    CHECK(rep.accepted || rep.reject_code == GatewayRejectCode::UnknownOrder, "Replace returns valid result");
+
+    auto cack = adapter.cancel_order("o1");
+    CHECK(cack.accepted || cack.reject_code == GatewayRejectCode::UnknownOrder, "Cancel returns valid result");
+
+    CHECK(BinanceAdapter::normalize_to_internal("btc-usdt") == "BTCUSDT", "Symbol to internal");
+    CHECK(BinanceAdapter::symbol_to_external("btc/usdt") == "BTCUSDT", "Symbol to external");
+
+    CHECK(BinanceAdapter::translate_binance_error(-1003) == ExchangeErrorCode::RateLimited,
+          "Error translation rate limit");
+    CHECK(BinanceAdapter::translate_binance_error(-2011) == ExchangeErrorCode::OrderNotFound,
+          "Error translation order not found");
+
+    const auto& st = adapter.stats();
+    CHECK(st.submitted_orders >= 2, "Metrics submitted_orders updated");
+    CHECK(st.accepted_orders >= 1, "Metrics accepted_orders updated");
+    CHECK(st.errors >= 1, "Metrics errors updated");
+
+    adapter.heartbeat();
+    adapter.disconnect();
+    CHECK(!adapter.is_connected(), "Adapter disconnected");
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -863,10 +1523,19 @@ int main() {
     test_inventory_manager();
     test_risk_manager();
     test_profiler();
+    test_portfolio_risk_engine();
     test_config();
+    test_rest_client();
     test_stat_arb();
     test_execution_algos();
+    test_paper_exchange();
+    test_exchange_adapter();
+    test_websocket_engine();
+    test_binance_adapter();
+    test_session_manager();
     test_full_integration();
+    test_oms_reconciler();
+    
 
         std::cout << "==================================================\n";
     std::cout << "  Results: " << g_pass << " passed, " << g_fail << " failed\n";

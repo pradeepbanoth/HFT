@@ -200,12 +200,12 @@ public:
                 }
             }
 
-            if (global_.enforce_post_only && order.order_type == OrderType::PostOnly) {
+            if (global_.enforce_post_only && order.order_type != OrderType::Market) {
                 if (would_cross(order, *book)) {
-                    ++stats_.rejected;
-                    return RiskDecision::reject(RiskRejectCode::PostOnlyWouldCross);
-                }
-            }
+                     ++stats_.rejected;
+                     return RiskDecision::reject(RiskRejectCode::PostOnlyWouldCross);
+               }
+           }
         }
 
         double current_pos = portfolio.position(order.symbol);

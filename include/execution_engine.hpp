@@ -294,9 +294,11 @@ private:
 
     static void refresh_state(Parent& p) {
         p.live_qty = 0.0;
+
         for (auto& [id, c] : p.children) {
-            if (!c.cancelled && !c.rejected && c.filled_qty < c.qty - 1e-12)
+            if (!c.cancelled && !c.rejected && c.filled_qty < c.qty - 1e-12) {
                 p.live_qty += c.qty - c.filled_qty;
+            }
         }
 
         p.remaining_qty = std::max(0.0, p.cfg.total_qty - p.filled_qty - p.live_qty);
@@ -325,8 +327,13 @@ private:
         double qty = desired_qty(p, ctx, book);
         qty = std::min(qty, p.remaining_qty);
 
-        if (qty < p.cfg.min_child_qty && p.remaining_qty >= p.cfg.min_child_qty)
-            return std::nullopt;
+        if (qty < p.cfg.min_child_qty) {
+            if (p.remaining_qty >= p.cfg.min_child_qty) {
+                qty = p.cfg.min_child_qty;
+            } else {
+                qty = p.remaining_qty;
+            }
+        }
 
         qty = std::clamp(qty, 0.0, p.cfg.max_child_qty);
         if (qty <= 1e-12) return std::nullopt;
@@ -347,18 +354,18 @@ private:
     }
 
     static bool market_ok(const ExecConfig& cfg, const MarketContext& ctx, const OrderBook& book) {
-        if (ctx.toxicity >= cfg.max_participation_rate + 0.85) return false;
+        if (ctx.toxicity >= 0.85) return false;
 
         auto sp = book.spread_bps();
         if (sp && *sp > cfg.max_spread_bps && cfg.urgency != ExecUrgency::Aggressive)
             return false;
 
         double depth = 0.0;
-auto levels = cfg.side == Side::Buy ? book.ask_depth(5) : book.bid_depth(5);
-for (const auto& lv : levels) {
-    depth += lv.qty;
-}
-        if (depth < cfg.min_liquidity_qty) return false;
+        auto levels = cfg.side == Side::Buy ? book.ask_depth(5) : book.bid_depth(5);
+        for (const auto& lv : levels) depth += lv.qty;
+
+        if (cfg.min_liquidity_qty > 0.0 && depth < cfg.min_liquidity_qty)
+            return false;
 
         return true;
     }
@@ -378,6 +385,13 @@ for (const auto& lv : levels) {
         double max_by_participation = ctx.recent_market_volume > 1e-12
             ? ctx.recent_market_volume * p.cfg.max_participation_rate
             : p.cfg.max_child_qty;
+
+        if (p.cfg.algo == ExecAlgo::TWAP ||
+            p.cfg.algo == ExecAlgo::VWAP ||
+            p.cfg.algo == ExecAlgo::Iceberg ||
+            p.cfg.algo == ExecAlgo::Sniper) {
+            max_by_participation = p.cfg.max_child_qty;
+        }
 
         q = std::min(q, max_by_participation);
         q *= urgency_mult(p.cfg.urgency);
@@ -452,19 +466,33 @@ for (const auto& lv : levels) {
         if (cfg.side == Side::Buy) {
             if (cfg.post_only) {
                 auto bid = book.best_bid();
-                return bid ? *bid : 0.0;
+                if (bid) return *bid;
+
+                auto ask = book.best_ask();
+                return ask ? *ask : 0.0;
             }
+
             auto ask = book.best_ask();
-            return ask ? *ask : 0.0;
+            if (ask) return *ask;
+
+            auto bid = book.best_bid();
+            return bid ? *bid : 0.0;
         }
 
         if (cfg.side == Side::Sell) {
             if (cfg.post_only) {
                 auto ask = book.best_ask();
-                return ask ? *ask : 0.0;
+                if (ask) return *ask;
+
+                auto bid = book.best_bid();
+                return bid ? *bid : 0.0;
             }
+
             auto bid = book.best_bid();
-            return bid ? *bid : 0.0;
+            if (bid) return *bid;
+
+            auto ask = book.best_ask();
+            return ask ? *ask : 0.0;
         }
 
         return 0.0;

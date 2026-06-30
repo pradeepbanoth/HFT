@@ -9,6 +9,9 @@
 #include <cmath>
 #include <chrono>
 #include <numeric>
+#include <cstdio>
+#include <fstream>
+#include <cstdio>
 
 using namespace hft;
 using namespace hft::signals;
@@ -540,6 +543,139 @@ void test_fastbook_analytics_integration() {
     }
 }
 
+void test_tick_store() {
+    SUITE("TickStore");
+
+    const std::string path = "test_ticks.hftdb";
+
+    std::vector<MarketEvent> events;
+    events.push_back(L2Update{"BTCUSDT", BookSide::Bid, 100.0, 1.5, 1000, 1});
+    events.push_back(L2Update{"BTCUSDT", BookSide::Ask, 101.0, 2.0, 1001, 2});
+    events.push_back(Trade{"t1", "BTCUSDT", Side::Buy, 101.0, 0.1, 1002, Side::Buy, false});
+    events.push_back(L2Update{"ETHUSDT", BookSide::Bid, 200.0, 3.0, 1003, 3});
+
+    TickStore::write_file(path, events, true);
+
+    auto stats = TickStore::inspect(path);
+    CHECK(stats.records == 4, "TickStore records = 4");
+    CHECK(stats.l2 == 3, "TickStore L2 count = 3");
+    CHECK(stats.trades == 1, "TickStore trade count = 1");
+    CHECK(stats.first_ts == 1000, "TickStore first timestamp");
+    CHECK(stats.last_ts == 1003, "TickStore last timestamp");
+
+    auto all = TickStore::read_file(path);
+    CHECK(all.size() == 4, "TickStore read all events");
+
+    TickReplayFilter btc_only;
+    btc_only.symbol = "BTCUSDT";
+    auto btc = TickStore::read_file(path, btc_only);
+    CHECK(btc.size() == 3, "TickStore symbol filter BTCUSDT");
+
+    TickReplayFilter trades_only;
+    trades_only.include_l2 = false;
+    trades_only.include_l3 = false;
+    trades_only.include_trades = true;
+    auto trades = TickStore::read_file(path, trades_only);
+    CHECK(trades.size() == 1, "TickStore trades-only filter");
+    CHECK(std::holds_alternative<Trade>(trades[0]), "Trades-only result is Trade");
+
+    TickReplayFilter range;
+    range.start_ts = 1001;
+    range.end_ts = 1002;
+    auto ranged = TickStore::read_file(path, range);
+    CHECK(ranged.size() == 2, "TickStore timestamp range filter");
+
+    TickStoreEventSource source(path, btc_only);
+    MarketEvent e;
+    int count = 0;
+    while (source.next(e)) ++count;
+    CHECK(count == 3, "TickStoreEventSource iteration");
+
+    source.reset();
+    CHECK(source.next(e), "TickStoreEventSource reset works");
+
+    std::remove(path.c_str());
+}
+
+
+
+void test_distributed_optimizer() {
+    SUITE("DistributedOptimizer");
+
+    std::vector<MarketEvent> data;
+    data.push_back(L2Update{"BTCUSDT", BookSide::Bid, 100.0, 1.0, 1000, 1});
+    data.push_back(L2Update{"BTCUSDT", BookSide::Ask, 101.0, 1.0, 1001, 2});
+
+    std::vector<ParamRange> ranges = {
+        {"gamma", 0.1, 0.2, 0.1},
+        {"spread", 1.0, 2.0, 1.0}
+    };
+
+    auto trial_fn = [](const ParamMap& p, const std::vector<MarketEvent>& d, int fold) {
+        TrialResult r;
+        r.params = p;
+        r.sharpe = p.at("gamma") * 10.0 + p.at("spread");
+        r.calmar = r.sharpe * 0.5;
+        r.pnl = r.sharpe * 100.0;
+        r.pnl_pct = r.sharpe;
+        r.max_drawdown = -0.01;
+        r.total_fills = static_cast<int64_t>(d.size());
+        r.halted = false;
+        r.fold = fold;
+        return r;
+    };
+
+    DistOptConfig cfg;
+    cfg.n_workers = 2;
+    cfg.verbose = false;
+    cfg.resume = false;
+    cfg.checkpoint = true;
+    cfg.checkpoint_every = 1;
+    cfg.checkpoint_path = "test_dist_optimizer_checkpoint.csv";
+    cfg.objective = obj_sharpe;
+
+    DistributedOptimizer opt(cfg);
+    auto summary = opt.grid_search(ranges, data, trial_fn);
+
+    CHECK(summary.total == 4, "Distributed grid: 4 trials");
+    CHECK(summary.completed == 4, "Distributed grid: all completed");
+    CHECK(summary.failed == 0, "Distributed grid: no failures");
+    CHECK(!summary.top.empty(), "Distributed grid: top results populated");
+    CHECK(summary.best.objective >= summary.top.back().objective, "Distributed results sorted");
+    CHECK(summary.workers.size() == 2, "Worker telemetry size = 2");
+
+    auto csv = opt.results_to_csv();
+    CHECK(!csv.empty(), "Distributed results CSV non-empty");
+    CHECK(csv.find("objective") != std::string::npos, "Distributed CSV has header");
+
+    std::ifstream checkpoint(cfg.checkpoint_path);
+    CHECK(checkpoint.good(), "Checkpoint file created");
+    checkpoint.close();
+
+    std::remove(cfg.checkpoint_path.c_str());
+
+    DistOptConfig cfg2;
+    cfg2.n_workers = 2;
+    cfg2.verbose = false;
+    cfg2.resume = false;
+    cfg2.checkpoint = false;
+    cfg2.objective = obj_pnl;
+
+    DistributedOptimizer opt2(cfg2);
+    auto random_summary = opt2.random_search(ranges, 5, data, trial_fn, 123);
+
+    CHECK(random_summary.total == 5, "Distributed random: 5 trials");
+    CHECK(random_summary.completed == 5, "Distributed random: all completed");
+
+    ParamMap base;
+    base["gamma"] = 0.15;
+    base["spread"] = 1.5;
+
+    auto robust = opt2.monte_carlo_robustness(base, 5, 0.10, data, trial_fn, 123);
+    CHECK(!robust.empty(), "Monte Carlo robustness returns top results");
+}
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -552,6 +688,8 @@ int main() {
     test_fast_book();
     test_analytics();
     test_optimizer();
+    test_tick_store();
+    test_distributed_optimizer();
     test_manual_drive_api();
     test_fastbook_analytics_integration();
 
