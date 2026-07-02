@@ -3,6 +3,8 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/hft.hpp"
+#include "market_data_engine.hpp"
+#include "smart_order_router.hpp"
 #include <iostream>
 #include <iomanip>
 #include <cassert>
@@ -12,6 +14,7 @@
 #include <cstdio>
 #include <fstream>
 #include <cstdio>
+#include <cstdlib>
 
 using namespace hft;
 using namespace hft::signals;
@@ -676,6 +679,1329 @@ void test_distributed_optimizer() {
 }
 
 
+void test_market_data_engine_advanced() {
+    namespace md = hft::marketdata;
+    namespace ex = hft::exchange;
+
+    ex::ExchangeBus bus;
+    bus.start();
+
+    std::atomic<int> l2_count{0};
+
+    bus.subscribe<ex::L2Update>(
+        ex::ExchangeEventType::L2Update,
+        [&](const ex::ExchangeEventHeader&, const ex::L2Update& u) {
+            if (u.symbol == "BTC-USDT") {
+                l2_count.fetch_add(1, std::memory_order_relaxed);
+            }
+        },
+        "advanced-md-sub"
+    );
+
+    md::MarketDataEngine engine(&bus);
+    engine.add_symbol_mapping("BTCUSDT", "BTC-USDT");
+
+    md::RawMarketPacket p1;
+    p1.venue = "BINANCE";
+    p1.symbol = "BTCUSDT";
+    p1.type = md::MdPacketType::L2Update;
+    p1.sequence = 1;
+    p1.side = md::MdSide::Bid;
+    p1.price = 100.0;
+    p1.qty = 1.0;
+    p1.exchange_ts_ns = md::md_now_ns() - 1000;
+    p1.receive_ts_ns = md::md_now_ns();
+
+    CHECK(engine.on_packet(p1), "Advanced MD accepts seq 1");
+
+    md::RawMarketPacket p3 = p1;
+    p3.sequence = 3;
+    p3.price = 102.0;
+
+    CHECK(engine.on_packet(p3), "Advanced MD buffers gap seq 3");
+    CHECK(engine.snapshot_pending("BINANCE", "BTCUSDT"), "Advanced MD snapshot pending");
+
+    md::RawMarketPacket p2 = p1;
+    p2.sequence = 2;
+    p2.price = 101.0;
+
+    CHECK(engine.on_packet(p2), "Advanced MD accepts seq 2 and drains seq 3");
+
+    bus.dispatch_once(10);
+
+    auto book = engine.book("BTC-USDT", 10);
+
+    CHECK(book.bids.size() == 3, "Book has 3 bid levels");
+    CHECK(book.bids[0].price == 102.0, "Best bid is seq 3 price");
+    CHECK(book.bids[1].price == 101.0, "Second bid is seq 2 price");
+    CHECK(book.bids[2].price == 100.0, "Third bid is seq 1 price");
+
+    md::RawMarketPacket duplicate = p2;
+    CHECK(!engine.on_packet(duplicate), "Advanced MD rejects duplicate");
+
+    auto metrics = engine.metrics_snapshot();
+
+    CHECK(metrics.packets_received == 4, "Advanced metrics packets received");
+    CHECK(metrics.packets_duplicate == 1, "Advanced metrics duplicate");
+    CHECK(metrics.sequence_gaps == 1, "Advanced metrics gap");
+    CHECK(metrics.packets_buffered == 1, "Advanced metrics buffered");
+    CHECK(metrics.packets_applied >= 3, "Advanced metrics applied");
+
+    bus.stop();
+}
+
+
+void test_lock_free_market_data_cache() {
+    using namespace hft::marketdata;
+
+    LockFreeMarketDataCache<8> cache;
+
+    cache.update_bid("BTC-USDT", 100.0, 2.0, 1, md_now_ns());
+    cache.update_ask("BTC-USDT", 101.0, 3.0, 2, md_now_ns());
+
+    auto tob = cache.top_of_book("BTC-USDT");
+
+    CHECK(tob.has_value(), "TOB snapshot available");
+    CHECK(tob->valid(), "TOB valid");
+    CHECK(tob->bid_price == 100.0, "TOB bid price");
+    CHECK(tob->ask_price == 101.0, "TOB ask price");
+    CHECK(tob->mid() == 100.5, "TOB mid");
+    CHECK(tob->spread() == 1.0, "TOB spread");
+
+    for (int i = 0; i < 12; ++i) {
+        cache.update_trade(
+            "BTC-USDT",
+            CachedTrade{
+                100.0 + i,
+                1.0,
+                i % 2 == 0,
+                static_cast<uint64_t>(i + 3),
+                md_now_ns()
+            }
+        );
+    }
+
+    auto trades = cache.recent_trades("BTC-USDT");
+
+    CHECK(trades.size() == 8, "Recent trade cache bounded");
+    CHECK(trades.front().price == 104.0, "Recent trades evict oldest");
+    CHECK(trades.back().price == 111.0, "Recent trades latest correct");
+
+    auto stats = cache.stats_snapshot();
+
+    CHECK(stats.symbols_created == 1, "Cache symbol created");
+    CHECK(stats.tob_updates == 2, "Cache TOB update metric");
+    CHECK(stats.trade_updates == 12, "Cache trade update metric");
+}
+
+
+void test_market_data_engine_cache_integration() {
+    using namespace hft::marketdata;
+
+    MarketDataEngine engine;
+    engine.add_symbol_mapping("ETHUSDT", "ETH-USDT");
+
+    RawMarketPacket bid;
+    bid.venue = "BINANCE";
+    bid.symbol = "ETHUSDT";
+    bid.type = MdPacketType::L2Update;
+    bid.sequence = 1;
+    bid.side = MdSide::Bid;
+    bid.price = 200.0;
+    bid.qty = 5.0;
+
+    RawMarketPacket ask = bid;
+    ask.sequence = 2;
+    ask.side = MdSide::Ask;
+    ask.price = 201.0;
+    ask.qty = 6.0;
+
+    CHECK(engine.on_packet(bid), "Engine cache bid packet");
+    CHECK(engine.on_packet(ask), "Engine cache ask packet");
+
+    auto tob = engine.top_of_book("ETH-USDT");
+
+    CHECK(tob.has_value(), "Engine TOB available");
+    CHECK(tob->valid(), "Engine TOB valid");
+    CHECK(tob->mid() == 200.5, "Engine TOB mid");
+
+    RawMarketPacket trade = bid;
+    trade.type = MdPacketType::Trade;
+    trade.sequence = 3;
+    trade.price = 200.5;
+    trade.qty = 1.25;
+    trade.is_trade_buy = true;
+
+    CHECK(engine.on_packet(trade), "Engine trade packet");
+
+    auto trades = engine.recent_trades("ETH-USDT");
+
+    CHECK(trades.size() == 1, "Engine recent trade stored");
+    CHECK(trades[0].price == 200.5, "Engine trade price stored");
+    CHECK(trades[0].aggressor_buy, "Engine trade side stored");
+
+    auto stats = engine.cache_stats();
+
+    CHECK(stats.tob_updates == 2, "Engine cache TOB stats");
+    CHECK(stats.trade_updates == 1, "Engine cache trade stats");
+}
+
+void test_advanced_market_data_cache_features() {
+    using namespace hft::marketdata;
+
+    LockFreeMarketDataCache<16> cache;
+
+    const auto now = cache_now_ns();
+
+    cache.update_bid("BTC-USDT", 100.0, 5.0, 1, now, now - 500);
+    cache.update_ask("BTC-USDT", 101.0, 3.0, 2, now + 1, now - 400);
+
+    auto tob = cache.top_of_book("BTC-USDT");
+
+    CHECK(tob.has_value(), "Advanced TOB available");
+    CHECK(tob->valid(), "Advanced TOB valid");
+    CHECK(tob->spread() == 1.0, "Advanced spread");
+    CHECK(tob->mid() == 100.5, "Advanced mid");
+    CHECK(tob->imbalance() > 0.0, "Advanced imbalance positive");
+    CHECK(tob->micro_price() > 100.0, "Advanced micro price valid");
+    CHECK(tob->last_sequence == 2, "Advanced last sequence");
+
+    cache.update_trade(
+        "BTC-USDT",
+        CachedTrade{100.5, 1.25, true, 3, now - 300, now + 2}
+    );
+
+    auto latest = cache.latest_trade("BTC-USDT");
+
+    CHECK(latest.has_value(), "Latest trade available");
+    CHECK(latest->price == 100.5, "Latest trade price");
+    CHECK(latest->aggressor_buy, "Latest trade side");
+
+    auto stale = cache.top_of_book("BTC-USDT", 1);
+
+    CHECK(!stale.has_value(), "Stale TOB rejected with tiny timeout");
+
+    cache.update_bid("ETH-USDT", 200.0, 2.0, 1, cache_now_ns());
+    cache.update_ask("ETH-USDT", 199.0, 2.0, 2, cache_now_ns());
+
+    auto crossed = cache.top_of_book("ETH-USDT");
+
+    CHECK(crossed.has_value(), "Crossed TOB exists");
+    CHECK(crossed->crossed(), "Crossed book detected");
+
+    auto stats = cache.stats_snapshot();
+
+    CHECK(stats.symbols_created == 2, "Advanced symbols created");
+    CHECK(stats.tob_updates == 4, "Advanced TOB updates");
+    CHECK(stats.bid_updates == 2, "Advanced bid updates");
+    CHECK(stats.ask_updates == 2, "Advanced ask updates");
+    CHECK(stats.trade_updates == 1, "Advanced trade updates");
+    CHECK(stats.snapshot_reads >= 3, "Advanced snapshot reads");
+    CHECK(stats.stale_reads >= 1, "Advanced stale reads");
+    CHECK(stats.crossed_books >= 1, "Advanced crossed book metric");
+}
+
+
+void test_gap_recovery_engine_advanced() {
+    using namespace hft::marketdata;
+
+    auto ADV_ASSERT_TRUE = [](bool ok, const char* msg) {
+    if (ok) {
+        std::cout << "  PASS: " << msg << "\n";
+    } else {
+        std::cerr << "  FAIL: " << msg << "\n";
+        std::exit(1);
+      }
+    };
+
+    GapRecoveryConfig config;
+    config.max_buffered_packets_per_stream = 4;
+    config.recovery_timeout_ns = 1'000'000'000ULL;
+    config.request_snapshot_on_gap = true;
+    config.allow_buffer_replay = true;
+
+    GapRecoveryEngine recovery(config);
+
+    std::atomic<int> snapshot_requests{0};
+
+    std::string callback_key;
+    uint64_t callback_expected = 0;
+    uint64_t callback_received = 0;
+
+    recovery.set_snapshot_request_callback(
+    [&](const std::string& key, uint64_t expected, uint64_t received) {
+        callback_key = key;
+        callback_expected = expected;
+        callback_received = received;
+        snapshot_requests.fetch_add(1, std::memory_order_relaxed);
+        }
+    );
+
+    RawMarketPacket p1;
+    p1.venue = "BINANCE";
+    p1.symbol = "BTC-USDT";
+    p1.type = MdPacketType::L2Update;
+    p1.sequence = 1;
+    p1.side = MdSide::Bid;
+    p1.price = 100.0;
+    p1.qty = 1.0;
+
+    const std::string key = "BINANCE:BTC-USDT";
+
+    auto r1 = recovery.on_packet(key, p1);
+
+    ADV_ASSERT_TRUE(r1.decision == RecoveryDecision::ApplyNow, "Advanced recovery apply first");
+    ADV_ASSERT_TRUE(r1.should_apply, "Advanced recovery first should apply");
+
+    RawMarketPacket p4 = p1;
+    p4.sequence = 4;
+    p4.price = 104.0;
+
+    auto r4 = recovery.on_packet(key, p4);
+
+    ADV_ASSERT_TRUE(r4.decision == RecoveryDecision::GapDetected, "Advanced recovery gap detected");
+    ADV_ASSERT_TRUE(!r4.should_apply, "Advanced recovery gap not applied");
+    ADV_ASSERT_TRUE(r4.should_request_snapshot, "Advanced recovery requests snapshot");
+    ADV_ASSERT_TRUE(snapshot_requests.load() == 1, "Advanced recovery snapshot callback fired");
+    ADV_ASSERT_TRUE(callback_key == "BINANCE:BTC-USDT", "Snapshot callback key");
+    ADV_ASSERT_TRUE(callback_expected == 2, "Snapshot callback expected seq");
+    ADV_ASSERT_TRUE(callback_received == 4, "Snapshot callback received seq");
+    ADV_ASSERT_TRUE(recovery.buffered_count(key) == 1, "Advanced recovery buffered p4");
+
+    RawMarketPacket p3 = p1;
+    p3.sequence = 3;
+    p3.price = 103.0;
+
+    auto r3 = recovery.on_packet(key, p3);
+
+    ADV_ASSERT_TRUE(r3.decision == RecoveryDecision::GapDetected, "Advanced recovery buffers p3");
+    ADV_ASSERT_TRUE(recovery.buffered_count(key) == 2, "Advanced recovery buffered p3 and p4");
+
+    auto replay = recovery.apply_snapshot(key, 2);
+
+    ADV_ASSERT_TRUE(replay.size() == 2, "Advanced recovery replay size");
+    ADV_ASSERT_TRUE(replay.packets[0].sequence == 3, "Advanced recovery replay seq 3");
+    ADV_ASSERT_TRUE(replay.packets[1].sequence == 4, "Advanced recovery replay seq 4");
+    ADV_ASSERT_TRUE(recovery.last_sequence(key) == 4, "Advanced recovery last seq 4");
+    ADV_ASSERT_TRUE(recovery.state(key) == hft::marketdata::RecoveryState::Synced,"Advanced recovery synced");
+
+    auto dup = recovery.on_packet(key, p4);
+
+    ADV_ASSERT_TRUE(dup.decision == RecoveryDecision::Duplicate ||
+                dup.decision == RecoveryDecision::Old,
+                "Advanced recovery rejects replay duplicate");
+
+    auto metrics = recovery.metrics_snapshot();
+
+    ADV_ASSERT_TRUE(metrics.packets_seen >= 4, "Advanced recovery packets seen");
+    ADV_ASSERT_TRUE(metrics.gaps_detected >= 2, "Advanced recovery gap metric");
+    ADV_ASSERT_TRUE(metrics.packets_buffered == 2, "Advanced recovery buffered metric");
+    ADV_ASSERT_TRUE(metrics.packets_replayed == 2, "Advanced recovery replay metric");
+    ADV_ASSERT_TRUE(metrics.snapshots_requested >= 1, "Advanced recovery snapshot request metric");
+    ADV_ASSERT_TRUE(metrics.snapshots_applied == 1, "Advanced recovery snapshot applied metric");
+}
+
+
+
+
+void test_smart_order_router() {
+    hft::routing::SmartOrderRouter router;
+
+    router.update_quote({"BINANCE", "BTC-USDT", 100.0, 101.0, 2.0, 2.0, 1.0, 20.0, true});
+    router.update_quote({"OKX", "BTC-USDT", 99.8, 101.2, 5.0, 5.0, 0.5, 10.0, true});
+    router.update_quote({"BYBIT", "BTC-USDT", 99.5, 102.0, 10.0, 10.0, 2.0, 50.0, true});
+
+    hft::routing::RouterOrder order;
+    order.symbol = "BTC-USDT";
+    order.side = hft::routing::Side::Buy;
+    order.type = hft::routing::OrderType::Limit;
+    order.qty = 6.0;
+    order.limit_price = 102.5;
+
+    auto result = router.route(order);
+
+    CHECK(
+    result.decision == hft::routing::RouteDecision::SplitVenues,
+    "SOR split venue decision"
+       );
+
+    CHECK(result.children.size() >= 2, "SOR creates multiple child routes");
+    CHECK(result.expected_avg_price > 0.0, "SOR expected avg price");
+    CHECK(result.expected_total_cost > 0.0, "SOR expected total cost");
+
+    double routed_qty = 0.0;
+
+    for (const auto& child : result.children) {
+    routed_qty += child.qty;
+    CHECK(!child.venue.empty(), "SOR child venue set");
+    CHECK(child.qty > 0.0, "SOR child qty positive");
+    CHECK(child.price > 0.0, "SOR child price positive");
+    }
+
+    CHECK(std::abs(routed_qty - 6.0) < 0.000001, "SOR routed full quantity");
+    CHECK(router.metrics().route_requests.load() == 1, "SOR route metric");
+}
+
+
+
+void test_child_order_manager_core() {
+    hft::execution::ChildOrderManager com;
+
+    hft::execution::ParentCreateRequest request;
+    request.symbol = "BTC-USDT";
+    request.side = hft::execution::ChildOrderSide::Buy;
+    request.quantity = 10.0;
+    request.timestamp_ns = 1000;
+
+    auto parent_id = com.create_parent(request);
+
+    CHECK(parent_id > 0, "COM parent created");
+
+    std::vector<hft::execution::ChildOrderRoute> routes = {
+        {"BINANCE", 4.0, 101.0},
+        {"OKX", 6.0, 101.2}
+    };
+
+    auto child_ids = com.create_children(parent_id, routes, 1100);
+
+    CHECK(child_ids.size() == 2, "COM children created");
+
+    CHECK(com.mark_submitted(child_ids[0], 1200), "COM child submitted");
+    CHECK(com.acknowledge(child_ids[0], "BN-1", 1300), "COM child acknowledged");
+
+    CHECK(com.apply_fill(child_ids[0], 2.0, 101.0, 1400), "COM partial fill applied");
+
+    auto child = com.child(child_ids[0]);
+    CHECK(child.has_value(), "COM child lookup");
+    CHECK(child->state == hft::execution::ChildOrderState::PartiallyFilled, "COM child partially filled");
+    CHECK(child->filled_quantity == 2.0, "COM child filled quantity");
+    CHECK(child->remaining_quantity == 2.0, "COM child remaining quantity");
+
+    auto parent = com.parent(parent_id);
+    CHECK(parent.has_value(), "COM parent lookup");
+    CHECK(parent->state == hft::execution::ParentOrderState::PartiallyFilled, "COM parent partially filled");
+    CHECK(parent->filled_quantity == 2.0, "COM parent filled quantity");
+    CHECK(parent->remaining_quantity == 8.0, "COM parent remaining quantity");
+
+    CHECK(com.apply_fill(child_ids[0], 2.0, 101.5, 1500), "COM final fill child one");
+
+    CHECK(com.mark_submitted(child_ids[1], 1600), "COM child two submitted");
+    CHECK(com.acknowledge(child_ids[1], "OKX-1", 1700), "COM child two acknowledged");
+    CHECK(com.apply_fill(child_ids[1], 6.0, 101.2, 1800), "COM child two filled");
+
+    parent = com.parent(parent_id);
+    CHECK(parent.has_value(), "COM parent lookup final");
+    CHECK(parent->state == hft::execution::ParentOrderState::Filled, "COM parent filled");
+    CHECK(parent->filled_quantity == 10.0, "COM parent full fill quantity");
+    CHECK(parent->remaining_quantity < 0.000001, "COM parent no remaining quantity");
+    CHECK(parent->average_price > 0.0, "COM parent VWAP calculated");
+
+    CHECK(com.metrics().parents_created.load() == 1, "COM parent metric");
+    CHECK(com.metrics().children_created.load() == 2, "COM children metric");
+    CHECK(com.metrics().full_fills.load() == 2, "COM full fill metric");
+}
+
+
+void test_child_order_manager_execution_reports() {
+    hft::execution::ChildOrderManager com;
+
+    hft::execution::ParentCreateRequest request;
+    request.symbol = "ETH-USDT";
+    request.side = hft::execution::ChildOrderSide::Sell;
+    request.quantity = 5.0;
+    request.timestamp_ns = 1000;
+
+    auto parent_id = com.create_parent(request);
+    CHECK(parent_id > 0, "COM parent created for reports");
+
+    std::vector<hft::execution::ChildOrderRoute> routes = {
+        {"BINANCE", 2.0, 2000.0},
+        {"OKX", 3.0, 1999.5}
+    };
+
+    auto child_ids = com.create_children(parent_id, routes, 1100);
+    CHECK(child_ids.size() == 2, "COM report children created");
+
+    CHECK(com.mark_submitted(child_ids[0], 1200), "COM first child submitted");
+    CHECK(com.mark_submitted(child_ids[1], 1200), "COM second child submitted");
+
+    hft::execution::ExecutionReport ack;
+    ack.type = hft::execution::ExecutionReportType::Ack;
+    ack.child_id = child_ids[0];
+    ack.venue_order_id = "BN-ETH-1";
+    ack.timestamp_ns = 1300;
+
+    CHECK(com.on_execution_report(ack), "COM ack report handled");
+
+    auto by_venue = com.child_by_venue_order_id("BN-ETH-1");
+    CHECK(by_venue.has_value(), "COM venue order lookup works");
+
+    hft::execution::ExecutionReport partial;
+    partial.type = hft::execution::ExecutionReportType::PartialFill;
+    partial.venue_order_id = "BN-ETH-1";
+    partial.fill_qty = 1.0;
+    partial.fill_price = 2000.0;
+    partial.timestamp_ns = 1400;
+
+    CHECK(com.on_execution_report(partial), "COM partial fill report handled");
+
+    auto child = com.child(child_ids[0]);
+    CHECK(child.has_value(), "COM child after partial lookup");
+    CHECK(child->state == hft::execution::ChildOrderState::PartiallyFilled, "COM child partial state");
+
+    hft::execution::ExecutionReport fill;
+    fill.type = hft::execution::ExecutionReportType::Fill;
+    fill.venue_order_id = "BN-ETH-1";
+    fill.fill_qty = 1.0;
+    fill.fill_price = 2001.0;
+    fill.timestamp_ns = 1500;
+
+    CHECK(com.on_execution_report(fill), "COM final fill report handled");
+
+    child = com.child(child_ids[0]);
+    CHECK(child.has_value(), "COM child after final fill lookup");
+    CHECK(child->state == hft::execution::ChildOrderState::Filled, "COM child filled through reports");
+
+    hft::execution::ExecutionReport reject;
+    reject.type = hft::execution::ExecutionReportType::Reject;
+    reject.child_id = child_ids[1];
+    reject.reason = "Venue throttled";
+    reject.timestamp_ns = 1600;
+
+    CHECK(com.on_execution_report(reject), "COM reject report handled");
+
+    auto parent = com.parent(parent_id);
+    CHECK(parent.has_value(), "COM parent after reject lookup");
+    CHECK(parent->filled_quantity == 2.0, "COM parent aggregated fill after reports");
+    CHECK(parent->remaining_quantity == 3.0, "COM parent remaining after reject");
+
+    auto metrics = com.metrics_snapshot();
+    CHECK(metrics.children_acknowledged == 1, "COM ack metric");
+    CHECK(metrics.partial_fills == 1, "COM partial metric");
+    CHECK(metrics.full_fills == 1, "COM full fill metric");
+    CHECK(metrics.rejects == 1, "COM reject metric");
+    CHECK(metrics.avg_ack_latency_us > 0.0, "COM ack latency metric");
+    CHECK(metrics.avg_fill_latency_us > 0.0, "COM fill latency metric");
+}
+
+
+void test_child_order_command_factory() {
+    hft::execution::ChildOrderManager com;
+
+    hft::execution::ParentCreateRequest request;
+    request.symbol = "BTC-USDT";
+    request.side = hft::execution::ChildOrderSide::Buy;
+    request.quantity = 3.0;
+    request.timestamp_ns = 1000;
+
+    auto parent_id = com.create_parent(request);
+    CHECK(parent_id > 0, "COM command parent created");
+
+    std::vector<hft::execution::ChildOrderRoute> routes = {
+        {"BINANCE", 1.0, 101.0},
+        {"OKX", 2.0, 101.2}
+    };
+
+    auto children = com.create_children(parent_id, routes, 1100);
+    CHECK(children.size() == 2, "COM command children created");
+
+    hft::execution::ChildOrderCommandFactory factory(com);
+
+    auto submit_commands = factory.build_submit_commands(children, 1200);
+
+    CHECK(submit_commands.size() == 2, "COM submit commands created");
+    CHECK(submit_commands[0].type == hft::execution::ChildCommandType::Submit, "COM submit command type");
+    CHECK(!submit_commands[0].client_order_id.empty(), "COM submit client id");
+    CHECK(submit_commands[0].quantity > 0.0, "COM submit quantity");
+
+    auto cancel_cmd = factory.build_cancel_command(children[0], 1300);
+
+    CHECK(cancel_cmd.has_value(), "COM cancel command created");
+    CHECK(cancel_cmd->type == hft::execution::ChildCommandType::Cancel, "COM cancel command type");
+
+    auto child = com.child(children[0]);
+    CHECK(child.has_value(), "COM child after cancel lookup");
+    CHECK(child->state == hft::execution::ChildOrderState::CancelPending, "COM child cancel pending");
+
+    auto replace_cmd = factory.build_replace_command(children[1], 2.5, 101.1, 1400);
+
+    CHECK(replace_cmd.has_value(), "COM replace command created");
+    CHECK(replace_cmd->type == hft::execution::ChildCommandType::Replace, "COM replace command type");
+    CHECK(replace_cmd->quantity == 2.5, "COM replace quantity");
+    CHECK(replace_cmd->price == 101.1, "COM replace price");
+
+    child = com.child(children[1]);
+    CHECK(child.has_value(), "COM child after replace lookup");
+    CHECK(child->state == hft::execution::ChildOrderState::ReplacePending, "COM child replace pending");
+}
+
+
+void test_child_order_command_factory_advanced() {
+    hft::execution::ChildOrderManager com;
+
+    hft::execution::ParentCreateRequest request;
+    request.symbol = "BTC-USDT";
+    request.side = hft::execution::ChildOrderSide::Buy;
+    request.quantity = 3.0;
+    request.timestamp_ns = 1000;
+
+    auto parent_id = com.create_parent(request);
+    CHECK(parent_id > 0, "Advanced commands parent created");
+
+    std::vector<hft::execution::ChildOrderRoute> routes = {
+        {"BINANCE", 1.0, 101.0},
+        {"OKX", 2.0, 101.2}
+    };
+
+    auto children = com.create_children(parent_id, routes, 1100);
+    CHECK(children.size() == 2, "Advanced commands children created");
+
+    hft::execution::ChildOrderCommandFactory factory(com);
+
+    auto submits = factory.build_submit_commands(children, 1200);
+    CHECK(submits.size() == 2, "Advanced submit commands created");
+
+    CHECK(submits[0].command_id > 0, "Advanced command id created");
+    CHECK(!submits[0].idempotency_key.empty(), "Advanced idempotency key created");
+
+    CHECK(factory.mark_sent(submits[0].command_id, 1300), "Advanced command marked sent");
+    CHECK(factory.mark_acked(submits[0].command_id, 1400), "Advanced command marked acked");
+
+    auto stored = factory.command(submits[0].command_id);
+    CHECK(stored.has_value(), "Advanced command lookup");
+    CHECK(stored->state == hft::execution::ChildCommandState::Acked, "Advanced command acked state");
+
+    auto by_key = factory.command_by_idempotency_key(submits[0].idempotency_key);
+    CHECK(by_key.has_value(), "Advanced command idempotency lookup");
+
+    auto cancel = factory.build_cancel_command(children[1], 1500);
+    CHECK(cancel.has_value(), "Advanced cancel command created");
+
+    CHECK(factory.mark_sent(cancel->command_id, 1600), "Advanced cancel sent");
+    CHECK(factory.mark_failed(cancel->command_id, "network error", 1700), "Advanced cancel failed");
+
+    auto failed = factory.command(cancel->command_id);
+    CHECK(failed.has_value(), "Advanced failed command lookup");
+    CHECK(failed->state == hft::execution::ChildCommandState::Failed, "Advanced command failed state");
+
+    auto expired = factory.expire_stale_commands(10'000, 1000);
+    CHECK(expired.size() == 1, "Advanced stale unsent command expired");
+
+    CHECK(factory.metrics().created.load() >= 3, "Advanced command created metric");
+    CHECK(factory.metrics().sent.load() == 2, "Advanced command sent metric");
+    CHECK(factory.metrics().acked.load() == 1, "Advanced command acked metric");
+    CHECK(factory.metrics().failed.load() == 1, "Advanced command failed metric");
+}
+
+
+void test_child_order_adapter_handoff() {
+    hft::execution::ChildOrderManager com;
+
+    hft::execution::ParentCreateRequest request;
+    request.symbol = "BTC-USDT";
+    request.side = hft::execution::ChildOrderSide::Buy;
+    request.quantity = 2.0;
+    request.timestamp_ns = 1000;
+
+    auto parent_id = com.create_parent(request);
+    CHECK(parent_id > 0, "Handoff parent created");
+
+    std::vector<hft::execution::ChildOrderRoute> routes = {
+        {"BINANCE", 2.0, 101.0}
+    };
+
+    auto children = com.create_children(parent_id, routes, 1100);
+    CHECK(children.size() == 1, "Handoff child created");
+
+    hft::execution::ChildOrderCommandFactory factory(com);
+    auto submit_commands = factory.build_submit_commands(children, 1200);
+
+    CHECK(submit_commands.size() == 1, "Handoff submit command created");
+
+    hft::execution::ChildOrderAdapterHandoff handoff;
+
+    auto missing = handoff.handoff(submit_commands[0]);
+    CHECK(
+        missing.status == hft::execution::AdapterHandoffStatus::AdapterMissing,
+        "Handoff detects missing adapter"
+    );
+
+    auto adapter = std::make_shared<hft::execution::MockChildOrderExecutionAdapter>();
+    handoff.register_adapter("BINANCE", adapter);
+
+    auto result = handoff.handoff(submit_commands[0]);
+
+    CHECK(
+        result.status == hft::execution::AdapterHandoffStatus::Accepted,
+        "Handoff submit accepted"
+    );
+
+    CHECK(adapter->submitted.size() == 1, "Mock adapter received submit");
+    CHECK(handoff.metrics().accepted.load() == 1, "Handoff accepted metric");
+
+    auto ack_report = hft::execution::ExecutionReport{};
+    ack_report.type = hft::execution::ExecutionReportType::Ack;
+    ack_report.child_id = children[0];
+    ack_report.venue_order_id = "BN-ORDER-1";
+    ack_report.timestamp_ns = 1300;
+
+    CHECK(com.on_execution_report(ack_report), "Handoff COM ack applied");
+
+    auto cancel_cmd = factory.build_cancel_command(children[0], 1400);
+    CHECK(cancel_cmd.has_value(), "Handoff cancel command created");
+
+    auto cancel_result = handoff.handoff(*cancel_cmd);
+
+    CHECK(
+        cancel_result.status == hft::execution::AdapterHandoffStatus::Accepted,
+        "Handoff cancel accepted"
+    );
+
+    CHECK(adapter->cancelled.size() == 1, "Mock adapter received cancel");
+
+    auto replace_cmd = factory.build_replace_command(children[0], 2.0, 100.8, 1500);
+
+    CHECK(!replace_cmd.has_value(), "Replace rejected while cancel pending");
+}
+
+
+void test_child_order_adapter_handoff_advanced() {
+    hft::execution::ChildOrderManager com;
+
+    hft::execution::ParentCreateRequest request;
+    request.symbol = "ETH-USDT";
+    request.side = hft::execution::ChildOrderSide::Buy;
+    request.quantity = 4.0;
+    request.timestamp_ns = 1000;
+
+    auto parent_id = com.create_parent(request);
+    CHECK(parent_id > 0, "Advanced handoff parent created");
+
+    std::vector<hft::execution::ChildOrderRoute> routes = {
+        {"BINANCE", 2.0, 2000.0},
+        {"OKX", 2.0, 2001.0}
+    };
+
+    auto children = com.create_children(parent_id, routes, 1100);
+    CHECK(children.size() == 2, "Advanced handoff children created");
+
+    hft::execution::ChildOrderCommandFactory factory(com);
+    auto commands = factory.build_submit_commands(children, 1200);
+
+    CHECK(commands.size() == 2, "Advanced handoff submit commands");
+
+    hft::execution::ChildOrderAdapterHandoff handoff;
+
+    int callback_count = 0;
+    handoff.set_result_callback(
+        [&](const hft::execution::AdapterHandoffResult& result) {
+            if (result.child_id > 0) {
+                ++callback_count;
+            }
+        }
+    );
+
+    auto binance = std::make_shared<hft::execution::MockChildOrderExecutionAdapter>();
+    auto okx = std::make_shared<hft::execution::MockChildOrderExecutionAdapter>();
+
+    handoff.register_adapter("BINANCE", binance);
+    handoff.register_adapter("OKX", okx);
+
+    CHECK(handoff.has_adapter("BINANCE"), "Advanced handoff Binance adapter registered");
+    CHECK(handoff.has_adapter("OKX"), "Advanced handoff OKX adapter registered");
+
+    auto batch_results = handoff.handoff_batch(commands);
+
+    CHECK(batch_results.size() == 2, "Advanced handoff batch results");
+    CHECK(binance->submitted.size() == 1, "Advanced handoff Binance submitted");
+    CHECK(okx->submitted.size() == 1, "Advanced handoff OKX submitted");
+    CHECK(callback_count == 2, "Advanced handoff callback count");
+
+    auto binance_state = handoff.venue_state("BINANCE");
+    CHECK(binance_state.has_value(), "Advanced handoff venue state exists");
+    CHECK(binance_state->accepted == 1, "Advanced handoff venue accepted count");
+
+    CHECK(handoff.set_venue_enabled("OKX", false), "Advanced handoff disable OKX");
+
+    auto disabled_result = handoff.handoff(commands[1]);
+
+    CHECK(
+        disabled_result.status == hft::execution::AdapterHandoffStatus::AdapterDisabled,
+        "Advanced handoff disabled venue rejected"
+    );
+
+    CHECK(handoff.set_venue_enabled("OKX", true), "Advanced handoff enable OKX");
+
+    okx->accept_submit = false;
+
+    auto rejected_result = handoff.handoff(commands[1]);
+
+    CHECK(
+        rejected_result.status == hft::execution::AdapterHandoffStatus::Rejected,
+        "Advanced handoff adapter reject"
+    );
+
+    okx->accept_submit = true;
+    okx->throw_on_submit = true;
+
+    auto exception_result = handoff.handoff(commands[1]);
+
+    CHECK(
+        exception_result.status == hft::execution::AdapterHandoffStatus::ExceptionThrown,
+        "Advanced handoff exception handled"
+    );
+
+    CHECK(handoff.unregister_adapter("OKX"), "Advanced handoff unregister OKX");
+
+    auto missing_result = handoff.handoff(commands[1]);
+
+    CHECK(
+        missing_result.status == hft::execution::AdapterHandoffStatus::AdapterMissing,
+        "Advanced handoff missing after unregister"
+    );
+
+    auto metrics = handoff.metrics_snapshot();
+
+    CHECK(metrics.submit_attempts >= 6, "Advanced handoff submit attempts metric");
+    CHECK(metrics.accepted >= 2, "Advanced handoff accepted metric");
+    CHECK(metrics.rejected >= 4, "Advanced handoff rejected metric");
+    CHECK(metrics.disabled_adapter >= 1, "Advanced handoff disabled metric");
+    CHECK(metrics.missing_adapter >= 1, "Advanced handoff missing metric");
+    CHECK(metrics.exceptions >= 1, "Advanced handoff exception metric");
+    CHECK(metrics.avg_latency_us >= 0.0, "Advanced handoff latency metric");
+}
+
+
+void test_venue_scoring_engine() {
+    hft::routing::VenueScoringEngine scorer;
+
+    hft::routing::RouterOrder order;
+    order.symbol = "BTC-USDT";
+    order.side = hft::routing::Side::Buy;
+    order.type = hft::routing::OrderType::Limit;
+    order.qty = 1.0;
+    order.limit_price = 102.0;
+
+    std::vector<hft::routing::VenueQuote> quotes = {
+        {"BINANCE", "BTC-USDT", 100.0, 101.0, 5.0, 5.0, 1.0, 20.0, true},
+        {"OKX", "BTC-USDT", 99.8, 101.1, 5.0, 5.0, 0.5, 10.0, true},
+        {"SLOWX", "BTC-USDT", 99.7, 100.9, 5.0, 5.0, 10.0, 4000.0, true}
+    };
+
+    scorer.record_order_sent("SLOWX", "BTC-USDT");
+    scorer.record_reject("SLOWX", "BTC-USDT");
+
+    scorer.record_order_sent("OKX", "BTC-USDT");
+    scorer.record_fill("OKX", "BTC-USDT", 100);
+
+    auto scores = scorer.score_quotes(order, quotes);
+
+    CHECK(!scores.empty(), "Venue scores created");
+    CHECK(scores.front().venue == "OKX", "OKX selected as best scored venue");
+    CHECK(scores.front().score > 0.0, "Venue score positive");
+    CHECK(scores.front().fill_score > 0.0, "Venue fill score positive");
+    CHECK(scores.front().reject_score > 0.0, "Venue reject score positive");
+
+    auto best = scorer.best_venue(order, quotes);
+
+    CHECK(best.has_value(), "Best venue returned");
+    CHECK(best->venue == "OKX", "Best venue is OKX");
+
+    auto stats = scorer.stats_for("OKX", "BTC-USDT");
+
+    CHECK(stats != nullptr, "Venue stats found");
+    CHECK(stats->orders_sent.load() == 1, "Venue orders sent metric");
+    CHECK(stats->fills.load() == 1, "Venue fills metric");
+}
+
+
+void test_adaptive_smart_order_router() {
+    hft::routing::AdaptiveRouterConfig config;
+    config.min_score_to_route = 0.20;
+    config.router_config.min_child_qty = 0.000001;
+
+    hft::routing::AdaptiveSmartOrderRouter router(config);
+
+    router.update_quote({"BINANCE", "BTC-USDT", 100.0, 101.0, 2.0, 2.0, 1.0, 20.0, true});
+    router.update_quote({"OKX", "BTC-USDT", 99.8, 101.1, 5.0, 5.0, 0.5, 10.0, true});
+    router.update_quote({"SLOWX", "BTC-USDT", 99.7, 100.9, 10.0, 10.0, 10.0, 4000.0, true});
+
+    router.record_order_sent("SLOWX", "BTC-USDT");
+    router.record_reject("SLOWX", "BTC-USDT");
+
+    router.record_order_sent("OKX", "BTC-USDT");
+    router.record_fill("OKX", "BTC-USDT", 100);
+
+    hft::routing::RouterOrder order;
+    order.symbol = "BTC-USDT";
+    order.side = hft::routing::Side::Buy;
+    order.type = hft::routing::OrderType::Limit;
+    order.qty = 6.0;
+    order.limit_price = 102.0;
+
+    auto result = router.route(order);
+
+    CHECK(
+        result.decision == hft::routing::RouteDecision::SplitVenues,
+        "Adaptive SOR split decision"
+    );
+
+    CHECK(result.children.size() >= 2, "Adaptive SOR created child routes");
+    CHECK(result.children.front().venue == "OKX", "Adaptive SOR prioritizes scored venue");
+
+    double routed_qty = 0.0;
+
+    for (const auto& child : result.children) {
+        routed_qty += child.qty;
+        CHECK(!child.venue.empty(), "Adaptive SOR child venue");
+        CHECK(child.qty > 0.0, "Adaptive SOR child qty");
+        CHECK(child.price > 0.0, "Adaptive SOR child price");
+    }
+
+    CHECK(std::abs(routed_qty - 6.0) < 0.000001, "Adaptive SOR routed full quantity");
+    CHECK(router.metrics().route_requests.load() == 1, "Adaptive SOR route metric");
+    CHECK(router.metrics().split_venues.load() == 1, "Adaptive SOR split metric");
+}
+
+
+void test_adaptive_smart_order_router_advanced() {
+    hft::routing::AdaptiveRouterConfig config;
+    config.min_score_to_route = 0.20;
+    config.max_route_slippage_bps = 50.0;
+    config.router_config.min_child_qty = 0.000001;
+    config.quote_stale_after_ns = 1000;
+    config.reject_stale_quotes = true;
+
+    hft::routing::AdaptiveSmartOrderRouter router(config);
+
+    router.update_quote(
+        {"BINANCE", "BTC-USDT", 100.0, 101.0, 2.0, 2.0, 1.0, 20.0, true},
+        10'000
+    );
+
+    router.update_quote(
+        {"OKX", "BTC-USDT", 99.8, 101.1, 5.0, 5.0, 0.5, 10.0, true},
+        10'000
+    );
+
+    router.update_quote(
+        {"STALE", "BTC-USDT", 99.0, 100.5, 10.0, 10.0, 0.1, 5.0, true},
+        1
+    );
+
+    router.record_order_sent("OKX", "BTC-USDT");
+    router.record_fill("OKX", "BTC-USDT", 100);
+
+    router.record_order_sent("STALE", "BTC-USDT");
+    router.record_fill("STALE", "BTC-USDT", 100);
+
+    hft::routing::RouterOrder order;
+    order.symbol = "BTC-USDT";
+    order.side = hft::routing::Side::Buy;
+    order.type = hft::routing::OrderType::Limit;
+    order.qty = 6.0;
+    order.limit_price = 102.0;
+
+    auto result = router.route_advanced(order, 10'500);
+
+    CHECK(
+        result.decision == hft::routing::RouteDecision::SplitVenues,
+        "Advanced adaptive SOR split decision"
+    );
+
+    CHECK(result.children.size() == 2, "Advanced adaptive SOR filtered stale venue");
+    CHECK(result.children.front().venue == "OKX", "Advanced adaptive SOR prioritizes OKX");
+    CHECK(result.explanations.size() >= 2, "Advanced adaptive SOR explanations created");
+    CHECK(result.routed_qty == 6.0, "Advanced adaptive SOR routed quantity");
+    CHECK(result.remaining_qty < 0.000001, "Advanced adaptive SOR no remaining qty");
+    CHECK(!result.partial, "Advanced adaptive SOR not partial");
+
+    CHECK(
+        router.metrics().stale_quotes_filtered.load() >= 1,
+        "Advanced adaptive SOR stale quote metric"
+    );
+}
+
+
+void test_execution_simulator_full_fill() {
+    hft::routing::AdaptiveSmartOrderRouter router;
+
+    router.update_quote({"BINANCE", "BTC-USDT", 100.0, 101.0, 5.0, 5.0, 1.0, 20.0, true});
+    router.update_quote({"OKX", "BTC-USDT", 99.9, 101.1, 5.0, 5.0, 0.5, 10.0, true});
+
+    hft::execution::ChildOrderManager com;
+    hft::execution::ChildOrderCommandFactory factory(com);
+    hft::execution::ChildOrderAdapterHandoff handoff;
+
+    auto binance = std::make_shared<hft::execution::MockChildOrderExecutionAdapter>();
+    auto okx = std::make_shared<hft::execution::MockChildOrderExecutionAdapter>();
+
+    handoff.register_adapter("BINANCE", binance);
+    handoff.register_adapter("OKX", okx);
+
+    hft::execution::ExecutionSimulationConfig sim_config;
+    sim_config.mode = hft::execution::SimulatedExecutionMode::FullFill;
+
+    hft::execution::ExecutionSimulator sim(
+        router,
+        com,
+        factory,
+        handoff,
+        sim_config
+    );
+
+    hft::routing::RouterOrder order;
+    order.symbol = "BTC-USDT";
+    order.side = hft::routing::Side::Buy;
+    order.type = hft::routing::OrderType::Limit;
+    order.qty = 6.0;
+    order.limit_price = 102.0;
+
+    auto result = sim.run(order, 10'000);
+
+    CHECK(result.accepted, "Execution simulator accepted order");
+    CHECK(result.parent_id > 0, "Execution simulator created parent");
+    CHECK(!result.child_ids.empty(), "Execution simulator created children");
+    CHECK(!result.commands.empty(), "Execution simulator created commands");
+
+    auto parent = com.parent(result.parent_id);
+
+    CHECK(parent.has_value(), "Execution simulator parent lookup");
+    CHECK(parent->state == hft::execution::ParentOrderState::Filled, "Execution simulator parent filled");
+    CHECK(parent->filled_quantity == 6.0, "Execution simulator full fill quantity");
+    CHECK(parent->remaining_quantity < 0.000001, "Execution simulator no remaining qty");
+
+    CHECK(sim.metrics().simulations.load() == 1, "Execution simulator metric simulations");
+    CHECK(sim.metrics().accepted.load() == 1, "Execution simulator metric accepted");
+    CHECK(sim.metrics().reports_generated.load() >= 2, "Execution simulator generated reports");
+}
+
+
+void test_execution_simulator_advanced_profiles() {
+    hft::routing::AdaptiveSmartOrderRouter router;
+
+    router.update_quote({"BINANCE", "BTC-USDT", 100.0, 101.0, 5.0, 5.0, 1.0, 20.0, true});
+    router.update_quote({"OKX", "BTC-USDT", 99.9, 101.1, 5.0, 5.0, 0.5, 10.0, true});
+
+    hft::execution::ChildOrderManager com;
+    hft::execution::ChildOrderCommandFactory factory(com);
+    hft::execution::ChildOrderAdapterHandoff handoff;
+
+    auto binance = std::make_shared<hft::execution::MockChildOrderExecutionAdapter>();
+    auto okx = std::make_shared<hft::execution::MockChildOrderExecutionAdapter>();
+
+    handoff.register_adapter("BINANCE", binance);
+    handoff.register_adapter("OKX", okx);
+
+    hft::execution::ExecutionSimulationConfig config;
+    config.mode = hft::execution::SimulatedExecutionMode::Auto;
+    config.seed = 7;
+
+    hft::execution::ExecutionSimulator sim(router, com, factory, handoff, config);
+
+    hft::execution::VenueSimulationProfile binance_profile;
+    binance_profile.fill_probability = 1.0;
+    binance_profile.reject_probability = 0.0;
+    binance_profile.min_fill_ratio = 1.0;
+    binance_profile.max_fill_ratio = 1.0;
+    binance_profile.base_slippage_bps = 2.0;
+    binance_profile.impact_bps_per_unit = 0.5;
+
+    hft::execution::VenueSimulationProfile okx_profile;
+    okx_profile.fill_probability = 1.0;
+    okx_profile.reject_probability = 0.0;
+    okx_profile.min_fill_ratio = 0.5;
+    okx_profile.max_fill_ratio = 0.5;
+    okx_profile.base_slippage_bps = 1.0;
+    okx_profile.impact_bps_per_unit = 0.25;
+
+    sim.set_venue_profile("BINANCE", binance_profile);
+    sim.set_venue_profile("OKX", okx_profile);
+
+    hft::routing::RouterOrder order;
+    order.symbol = "BTC-USDT";
+    order.side = hft::routing::Side::Buy;
+    order.type = hft::routing::OrderType::Limit;
+    order.qty = 6.0;
+    order.limit_price = 102.0;
+
+    auto result = sim.run(order, 10'000);
+
+    CHECK(result.parent_id > 0, "Advanced sim parent created");
+    CHECK(!result.child_reports.empty(), "Advanced sim child reports created");
+    CHECK(result.filled_qty > 0.0, "Advanced sim filled quantity positive");
+    CHECK(result.avg_fill_price > 0.0, "Advanced sim average fill price");
+    CHECK(result.avg_fill_price >= 101.0, "Advanced sim buy slippage applied");
+
+    CHECK(sim.metrics().simulations.load() == 1, "Advanced sim simulations metric");
+    CHECK(sim.metrics().reports_generated.load() >= 2, "Advanced sim reports generated");
+}
+
+
+void test_queue_position_model() {
+    hft::routing::QueuePositionModel model;
+
+    hft::routing::QueueInputs fast;
+    fast.venue = "OKX";
+    fast.symbol = "BTC-USDT";
+    fast.side = hft::routing::Side::Buy;
+    fast.order_qty = 1.0;
+    fast.order_price = 101.0;
+    fast.best_bid = 100.9;
+    fast.best_ask = 101.0;
+    fast.bid_qty_ahead = 5.0;
+    fast.ask_qty_ahead = 3.0;
+    fast.recent_trade_qty = 20.0;
+    fast.recent_trade_rate_per_sec = 10.0;
+    fast.latency_us = 20.0;
+
+    auto fast_est = model.estimate(fast);
+
+    CHECK(fast_est.fill_probability > 0.0, "Queue model fill probability positive");
+    CHECK(fast_est.expected_fill_time_ms > 0.0, "Queue model expected fill time positive");
+    CHECK(fast_est.queue_position_qty > 0.0, "Queue model queue position positive");
+
+    hft::routing::QueueInputs slow = fast;
+    slow.venue = "SLOWX";
+    slow.order_price = 100.7;
+    slow.latency_us = 4000.0;
+    slow.recent_trade_qty = 1.0;
+    slow.recent_trade_rate_per_sec = 0.5;
+
+    auto slow_est = model.estimate(slow);
+
+    CHECK(
+        fast_est.fill_probability > slow_est.fill_probability,
+        "Queue model prefers aggressive liquid venue"
+    );
+
+    std::vector<hft::routing::QueueInputs> inputs = {slow, fast};
+    auto ranked = model.rank_by_fill_probability(inputs);
+
+    CHECK(ranked.size() == 2, "Queue model ranked two venues");
+    CHECK(ranked.front().venue == "OKX", "Queue model ranks OKX first");
+}
+
+
+void test_advanced_queue_position_model() {
+    hft::routing::QueuePositionModel model;
+
+    for (int i = 0; i < 20; ++i) {
+        model.record_event({
+            "OKX",
+            "BTC-USDT",
+            hft::routing::LiquidityEventType::Trade,
+            hft::routing::Side::Sell,
+            2.0,
+            101.0,
+            static_cast<uint64_t>(1000 + i)
+        });
+    }
+
+    for (int i = 0; i < 5; ++i) {
+        model.record_event({
+            "OKX",
+            "BTC-USDT",
+            hft::routing::LiquidityEventType::Cancel,
+            hft::routing::Side::Sell,
+            1.0,
+            101.0,
+            static_cast<uint64_t>(2000 + i)
+        });
+    }
+
+    for (int i = 0; i < 20; ++i) {
+        model.record_event({
+            "SLOWX",
+            "BTC-USDT",
+            hft::routing::LiquidityEventType::Add,
+            hft::routing::Side::Sell,
+            5.0,
+            101.0,
+            static_cast<uint64_t>(3000 + i)
+        });
+    }
+
+    hft::routing::QueueInputs okx;
+    okx.venue = "OKX";
+    okx.symbol = "BTC-USDT";
+    okx.side = hft::routing::Side::Buy;
+    okx.order_qty = 1.0;
+    okx.order_price = 101.0;
+    okx.best_bid = 100.9;
+    okx.best_ask = 101.0;
+    okx.bid_qty_ahead = 5.0;
+    okx.ask_qty_ahead = 3.0;
+    okx.recent_trade_qty = 20.0;
+    okx.recent_trade_rate_per_sec = 10.0;
+    okx.latency_us = 20.0;
+
+    hft::routing::QueueInputs slow = okx;
+    slow.venue = "SLOWX";
+    slow.order_price = 100.7;
+    slow.latency_us = 4000.0;
+    slow.recent_trade_qty = 1.0;
+    slow.recent_trade_rate_per_sec = 0.5;
+
+    auto okx_est = model.estimate(okx);
+    auto slow_est = model.estimate(slow);
+
+    CHECK(okx_est.fill_probability > 0.0, "Advanced queue fill probability positive");
+    CHECK(okx_est.expected_fill_time_ms > 0.0, "Advanced queue fill time positive");
+    CHECK(okx_est.queue_depletion_score > 0.0, "Advanced queue depletion score positive");
+    CHECK(okx_est.maker_quality_score > 0.0, "Advanced queue maker quality positive");
+
+    CHECK(
+        okx_est.fill_probability > slow_est.fill_probability,
+        "Advanced queue prefers active liquid venue"
+    );
+
+    std::vector<hft::routing::QueueInputs> inputs = {slow, okx};
+
+    auto ranked_fill = model.rank_by_fill_probability(inputs);
+    CHECK(ranked_fill.size() == 2, "Advanced queue ranked fill candidates");
+    CHECK(ranked_fill.front().venue == "OKX", "Advanced queue ranks OKX by fill probability");
+
+    auto ranked_quality = model.rank_by_maker_quality(inputs);
+    CHECK(ranked_quality.size() == 2, "Advanced queue ranked maker quality");
+
+    auto best = model.best_fill_candidate(inputs);
+    CHECK(best.has_value(), "Advanced queue best candidate exists");
+    CHECK(best->venue == "OKX", "Advanced queue best candidate OKX");
+
+    auto stats = model.venue_stats("OKX", "BTC-USDT");
+    CHECK(stats != nullptr, "Advanced queue venue stats found");
+    CHECK(stats->trades.load() == 20, "Advanced queue trade stats");
+    CHECK(stats->cancels.load() == 5, "Advanced queue cancel stats");
+
+    auto metrics = model.metrics_snapshot();
+    CHECK(metrics.venues_tracked == 2, "Advanced queue tracks two venues");
+    CHECK(metrics.total_trades == 20, "Advanced queue total trades metric");
+    CHECK(metrics.total_cancels == 5, "Advanced queue total cancels metric");
+}
+
+
+void test_fill_probability_engine() {
+    hft::routing::FillProbabilityEngine engine;
+
+    hft::routing::VenueQuote okx_quote{
+        "OKX", "BTC-USDT", 100.0, 101.0, 5.0, 5.0, 0.5, 10.0, true
+    };
+
+    hft::routing::VenueQuote slow_quote{
+        "SLOWX", "BTC-USDT", 100.0, 101.0, 5.0, 5.0, 10.0, 4000.0, true
+    };
+
+    hft::routing::QueueInputs okx_queue;
+    okx_queue.venue = "OKX";
+    okx_queue.symbol = "BTC-USDT";
+    okx_queue.side = hft::routing::Side::Buy;
+    okx_queue.order_qty = 1.0;
+    okx_queue.order_price = 101.0;
+    okx_queue.best_bid = 100.9;
+    okx_queue.best_ask = 101.0;
+    okx_queue.bid_qty_ahead = 2.0;
+    okx_queue.ask_qty_ahead = 1.0;
+    okx_queue.recent_trade_qty = 20.0;
+    okx_queue.recent_trade_rate_per_sec = 10.0;
+    okx_queue.latency_us = 10.0;
+
+    hft::routing::QueueInputs slow_queue = okx_queue;
+    slow_queue.venue = "SLOWX";
+    slow_queue.latency_us = 4000.0;
+    slow_queue.recent_trade_qty = 1.0;
+    slow_queue.recent_trade_rate_per_sec = 0.2;
+    slow_queue.order_price = 100.8;
+
+    engine.record_order_sent("OKX", "BTC-USDT");
+    engine.record_fill("OKX", "BTC-USDT", 1.0, 100.0);
+
+    engine.record_order_sent("SLOWX", "BTC-USDT");
+    engine.record_reject("SLOWX", "BTC-USDT");
+
+    std::vector<hft::routing::FillProbabilityInput> inputs = {
+        {okx_quote, okx_queue},
+        {slow_quote, slow_queue}
+    };
+
+
+    auto ranked = engine.rank(inputs);
+
+    CHECK(ranked.size() == 2, "Fill probability ranked two venues");
+    CHECK(ranked.front().venue == "OKX", "Fill probability prefers OKX");
+    CHECK(ranked.front().probability > ranked.back().probability, "Fill probability ranking valid");
+    CHECK(ranked.front().expected_fill_time_ms > 0.0, "Fill probability expected time positive");
+
+    auto best = engine.best(inputs);
+
+    CHECK(best.has_value(), "Fill probability best exists");
+    CHECK(best->venue == "OKX", "Fill probability best venue OKX");
+     auto stats = engine.stats_for("OKX", "BTC-USDT");
+
+    CHECK(stats.has_value(), "Advanced fill stats available");
+    CHECK(stats->fills == 1, "Advanced fill stats fills");
+    CHECK(stats->orders_sent == 1, "Advanced fill stats orders");
+    CHECK(ranked.front().confidence > 0.0, "Advanced fill confidence positive");
+    CHECK(ranked.front().expected_fill_qty > 0.0, "Advanced expected fill qty positive");
+}
+
+
+
+void test_execution_quality_analytics() {
+    hft::execution::ChildOrderManager com;
+
+    hft::execution::ParentCreateRequest request;
+    request.symbol = "BTC-USDT";
+    request.side = hft::execution::ChildOrderSide::Buy;
+    request.quantity = 5.0;
+    request.timestamp_ns = 1000;
+
+    auto parent_id = com.create_parent(request);
+    CHECK(parent_id > 0, "TCA parent created");
+
+    std::vector<hft::execution::ChildOrderRoute> routes = {
+        {"BINANCE", 2.0, 101.0},
+        {"OKX", 3.0, 101.2}
+    };
+
+    auto children = com.create_children(parent_id, routes, 1100);
+    CHECK(children.size() == 2, "TCA children created");
+
+    CHECK(com.mark_submitted(children[0], 1200), "TCA child one submitted");
+    CHECK(com.acknowledge(children[0], "BN-1", 1300), "TCA child one ack");
+    CHECK(com.apply_fill(children[0], 2.0, 101.0, 1400), "TCA child one filled");
+
+    CHECK(com.mark_submitted(children[1], 1200), "TCA child two submitted");
+    CHECK(com.acknowledge(children[1], "OKX-1", 1300), "TCA child two ack");
+    CHECK(com.apply_fill(children[1], 3.0, 101.2, 1500), "TCA child two filled");
+
+    hft::execution::ExecutionQualityAnalytics tca;
+
+    auto report = tca.parent_report(com, parent_id, 100.0);
+
+    CHECK(report.has_value(), "TCA parent report created");
+    CHECK(report->parent_id == parent_id, "TCA parent id");
+    CHECK(report->filled_qty == 5.0, "TCA filled quantity");
+    CHECK(report->fill_ratio == 1.0, "TCA fill ratio");
+    CHECK(report->average_fill_price > 100.0, "TCA average fill price");
+    CHECK(report->slippage_bps > 0.0, "TCA buy slippage positive");
+    CHECK(report->implementation_shortfall > 0.0, "TCA implementation shortfall positive");
+
+    auto venues = tca.venue_reports();
+
+    CHECK(venues.size() == 2, "TCA venue reports created");
+
+    auto binance = tca.venue_report("BINANCE", "BTC-USDT");
+
+    CHECK(binance.has_value(), "TCA binance report");
+    CHECK(binance->child_orders == 1, "TCA binance order count");
+    CHECK(binance->filled_children == 1, "TCA binance fill count");
+    CHECK(binance->fill_ratio == 1.0, "TCA binance fill ratio");
+
+    CHECK(tca.metrics().reports_generated.load() == 1, "TCA reports metric");
+    CHECK(tca.metrics().venue_updates.load() == 2, "TCA venue update metric");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -689,6 +2015,27 @@ int main() {
     test_analytics();
     test_optimizer();
     test_tick_store();
+    test_market_data_engine_advanced();
+    test_lock_free_market_data_cache();
+    test_market_data_engine_cache_integration();
+    test_advanced_market_data_cache_features();
+    test_gap_recovery_engine_advanced();
+    test_child_order_manager_core();
+    test_child_order_manager_execution_reports();
+    test_child_order_command_factory();
+    test_child_order_command_factory_advanced();
+    test_child_order_adapter_handoff();
+    test_child_order_adapter_handoff_advanced();
+    test_venue_scoring_engine();
+    test_adaptive_smart_order_router();
+    test_adaptive_smart_order_router_advanced();
+    test_execution_simulator_full_fill();
+    test_execution_simulator_advanced_profiles();
+    test_queue_position_model();
+    test_advanced_queue_position_model();
+    test_fill_probability_engine();
+    test_execution_quality_analytics();
+    test_smart_order_router();
     test_distributed_optimizer();
     test_manual_drive_api();
     test_fastbook_analytics_integration();

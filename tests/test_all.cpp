@@ -3,6 +3,9 @@
 // ─────────────────────────────────────────────────────────────────────────────
 
 #include "../include/hft.hpp"
+#include "arbitrage_execution_planner.hpp"
+#include "arbitrage_risk_guard.hpp"
+#include "arbitrage_executor.hpp"
 #include <iostream>
 #include <cassert>
 #include <cmath>
@@ -1134,6 +1137,559 @@ void test_execution_engine() {
 }
 
 
+void test_advanced_cross_exchange_arbitrage_engine() {
+    hft::arbitrage::ArbitrageConfig config;
+    config.min_net_edge_bps = 3.0;
+    config.safety_slippage_bps = 1.0;
+    config.max_notional = 1'000'000.0;
+    config.cooldown_ns = 60'000'000'000ULL; // 60 seconds
+
+    hft::arbitrage::CrossExchangeArbitrageEngine engine(config);
+
+    const uint64_t now = hft::arbitrage::arb_now_ns();
+
+    engine.update_market({
+        "BINANCE",
+        "BTC-USDT",
+        100.0,
+        101.0,
+        10.0,
+        10.0,
+        1.0,
+        0.5,
+        100.0,
+        now,
+        true
+    });
+
+    engine.update_market({
+        "OKX",
+        "BTC-USDT",
+        104.0,
+        105.0,
+        8.0,
+        8.0,
+        1.0,
+        0.5,
+        120.0,
+        now,
+        true
+    });
+
+    auto best = engine.best_opportunity("BTC-USDT");
+
+    CHECK(best.has_value(), "Advanced arbitrage opportunity detected");
+    CHECK(best->state == hft::arbitrage::ArbState::Executable,
+          "Advanced arbitrage executable");
+    CHECK(best->buy_venue == "BINANCE", "Advanced arb buy venue");
+    CHECK(best->sell_venue == "OKX", "Advanced arb sell venue");
+    CHECK(best->quantity == 8.0, "Advanced arb quantity");
+    CHECK(best->net_edge_bps > 3.0, "Advanced arb net edge");
+    CHECK(best->confidence > 0.0, "Advanced arb confidence");
+
+    auto plan = engine.build_execution_plan("BTC-USDT");
+
+    CHECK(plan.has_value(), "Execution plan generated");
+    CHECK(plan->executable, "Execution plan executable");
+    CHECK(plan->buy_leg.side == hft::arbitrage::ArbLegSide::Buy,
+          "Buy leg generated");
+    CHECK(plan->sell_leg.side == hft::arbitrage::ArbLegSide::Sell,
+          "Sell leg generated");
+    CHECK(plan->buy_leg.venue == "BINANCE", "Buy leg venue correct");
+    CHECK(plan->sell_leg.venue == "OKX", "Sell leg venue correct");
+    CHECK(plan->buy_leg.quantity == plan->sell_leg.quantity,
+          "Leg quantities balanced");
+
+    auto blocked = engine.build_execution_plan("BTC-USDT");
+
+    CHECK(!blocked.has_value(), "Cooldown blocks immediate repeat execution");
+}
+
+
+#include "arbitrage_execution_planner.hpp"
+
+void test_arbitrage_execution_planner() {
+    hft::arbitrage::ArbitrageOpportunity opp;
+    opp.symbol = "BTC-USDT";
+    opp.buy_venue = "BINANCE";
+    opp.sell_venue = "OKX";
+    opp.buy_price = 101.0;
+    opp.sell_price = 104.0;
+    opp.quantity = 2.0;
+    opp.net_edge_bps = 290.0;
+    opp.expected_profit = 6.0;
+
+    hft::arbitrage::ArbExecutionConfig config;
+    config.max_notional = 100000.0;
+    config.min_expected_profit = 1.0;
+    config.hedge_policy = hft::arbitrage::HedgePolicy::ImmediateBothLegs;
+
+    hft::arbitrage::ArbitrageExecutionPlanner planner(config);
+
+    auto plan = planner.build_plan(opp);
+
+    CHECK(
+        plan.state == hft::arbitrage::ExecutionPlanState::Ready,
+        "Arbitrage execution plan ready"
+    );
+
+    CHECK(plan.buy_leg.venue == "BINANCE", "Buy leg venue");
+    CHECK(plan.sell_leg.venue == "OKX", "Sell leg venue");
+    CHECK(plan.buy_leg.quantity == 2.0, "Buy leg quantity");
+    CHECK(plan.sell_leg.quantity == 2.0, "Sell leg quantity");
+    CHECK(plan.buy_leg.notional == 202.0, "Buy leg notional");
+    CHECK(plan.sell_leg.notional == 208.0, "Sell leg notional");
+    CHECK(plan.sor_orders.size() == 2, "Two SOR orders generated");
+
+    CHECK(
+        plan.sor_orders[0].side == hft::routing::Side::Buy,
+        "First SOR order is buy"
+    );
+
+    CHECK(
+        plan.sor_orders[1].side == hft::routing::Side::Sell,
+        "Second SOR order is sell"
+    );
+
+    CHECK(planner.metrics().plans_requested.load() == 1, "Planner request metric");
+    CHECK(planner.metrics().plans_ready.load() == 1, "Planner ready metric");
+
+    CHECK(plan.plan_id > 0, "Plan id generated");
+    CHECK(plan.created_ns > 0, "Plan creation timestamp set");
+    CHECK(plan.expires_ns > plan.created_ns, "Plan expiry timestamp set");
+    CHECK(plan.reject_code == hft::arbitrage::PlanRejectCode::None, "No reject code");
+    CHECK(plan.buy_leg.leg_id != plan.sell_leg.leg_id, "Unique leg ids");
+    CHECK(plan.buy_leg.plan_id == plan.plan_id, "Buy leg linked to plan");
+    CHECK(plan.sell_leg.plan_id == plan.plan_id, "Sell leg linked to plan");
+    CHECK(!planner.expired(plan), "Plan not expired immediately");
+}
+
+
+
+void test_arbitrage_executor() {
+    hft::arbitrage::ArbitrageOpportunity opp;
+    opp.symbol = "BTC-USDT";
+    opp.buy_venue = "BINANCE";
+    opp.sell_venue = "OKX";
+    opp.buy_price = 101.0;
+    opp.sell_price = 104.0;
+    opp.quantity = 2.0;
+    opp.net_edge_bps = 290.0;
+    opp.expected_profit = 6.0;
+
+    hft::arbitrage::ArbitrageExecutionPlanner planner;
+    auto plan = planner.build_plan(opp);
+
+    hft::arbitrage::ArbExecutorConfig config;
+    config.max_leg_imbalance_qty = 0.000001;
+
+    hft::arbitrage::ArbitrageExecutor executor(config);
+
+    auto submissions = executor.submit_plan(plan);
+
+    CHECK(submissions.size() == 2, "Arbitrage executor creates two submissions");
+    CHECK(submissions[0].plan_id == submissions[1].plan_id, "Both legs share plan id");
+
+    const uint64_t plan_id = submissions[0].plan_id;
+
+    CHECK(submissions[0].side == hft::arbitrage::ArbLegSide::Buy,
+        "First submission is buy leg"
+    );
+
+    CHECK(submissions[1].side == hft::arbitrage::ArbLegSide::Sell,
+        "Second submission is sell leg"
+    );
+
+    executor.on_report({
+        plan_id,
+        true,
+        hft::arbitrage::ArbExecReportType::Ack,
+        0.0,
+        0.0,
+        ""
+    });
+
+    executor.on_report({
+        plan_id,
+        false,
+        hft::arbitrage::ArbExecReportType::Ack,
+        0.0,
+        0.0,
+        ""
+    });
+
+    executor.on_report({
+        plan_id,
+        true,
+        hft::arbitrage::ArbExecReportType::Fill,
+        2.0,
+        101.0,
+        ""
+    });
+
+    executor.on_report({
+        plan_id,
+        false,
+        hft::arbitrage::ArbExecReportType::Fill,
+        2.0,
+        104.0,
+        ""
+    });
+
+    auto record = executor.record(plan_id);
+
+    CHECK(record.has_value(), "Arbitrage execution record exists");
+
+    CHECK(record->state == hft::arbitrage::ArbExecutorState::Completed,
+        "Arbitrage execution completed"
+    );
+
+    CHECK(record->buy_filled_qty == 2.0, "Buy fill quantity tracked");
+    CHECK(record->sell_filled_qty == 2.0, "Sell fill quantity tracked");
+    CHECK(record->buy_vwap == 101.0, "Buy VWAP tracked");
+    CHECK(record->sell_vwap == 104.0, "Sell VWAP tracked");
+
+    CHECK(executor.metrics().plans_submitted.load() == 1, "Executor submit metric");
+    CHECK(executor.metrics().plans_completed.load() == 1, "Executor completion metric");
+
+    CHECK(record->buy_leg.filled_qty == 2.0, "Buy fill tracked");
+    CHECK(record->sell_leg.filled_qty == 2.0, "Sell fill tracked");
+    CHECK(record->buy_leg.vwap == 101.0, "Buy VWAP");
+    CHECK(record->sell_leg.vwap == 104.0, "Sell VWAP");
+}
+
+
+
+void test_arbitrage_risk_guard() {
+    hft::arbitrage::ArbitrageOpportunity opp;
+    opp.symbol = "BTC-USDT";
+    opp.buy_venue = "BINANCE";
+    opp.sell_venue = "OKX";
+    opp.buy_price = 101.0;
+    opp.sell_price = 104.0;
+    opp.quantity = 2.0;
+    opp.net_edge_bps = 290.0;
+    opp.expected_profit = 6.0;
+
+    hft::arbitrage::ArbExecutionConfig exec_config;
+    exec_config.max_notional = 100000.0;
+    exec_config.min_expected_profit = 1.0;
+
+    hft::arbitrage::ArbitrageExecutionPlanner planner(exec_config);
+    auto plan = planner.build_plan(opp);
+
+    hft::arbitrage::ArbRiskConfig risk_config;
+    risk_config.max_plan_notional = 100000.0;
+    risk_config.max_symbol_exposure = 200000.0;
+    risk_config.max_venue_exposure = 200000.0;
+    risk_config.max_total_exposure = 500000.0;
+    risk_config.max_venue_concentration = 1.0;
+    risk_config.max_quote_age_ns = 1'000'000'000ULL;
+    risk_config.reject_cooldown_ns = 1'000'000ULL;
+
+    hft::arbitrage::ArbitrageRiskGuard guard(risk_config);
+
+    const uint64_t now = 10'000'000'000ULL;
+
+    hft::arbitrage::ArbRiskContext ctx;
+    ctx.now_ns = now;
+    ctx.buy_quote_ts_ns = now - 1000;
+    ctx.sell_quote_ts_ns = now - 1000;
+    ctx.realized_pnl_today = 0.0;
+    ctx.unrealized_pnl = 0.0;
+    ctx.inventory_base = 0.0;
+    ctx.inventory_quote = 0.0;
+
+    auto approved = guard.check(plan, ctx);
+
+    CHECK(
+        approved.decision == hft::arbitrage::ArbRiskDecision::Approved,
+        "Advanced arbitrage risk approved"
+    );
+
+    guard.reserve_exposure(plan);
+
+    auto exposure = guard.exposure_snapshot();
+
+    CHECK(exposure.total_exposure > 0.0, "Exposure reserved");
+    CHECK(exposure.symbol_exposure["BTC-USDT"] > 0.0, "Symbol exposure reserved");
+    CHECK(exposure.venue_exposure["BINANCE"] > 0.0, "Buy venue exposure reserved");
+    CHECK(exposure.venue_exposure["OKX"] > 0.0, "Sell venue exposure reserved");
+
+    guard.release_exposure(plan);
+
+    exposure = guard.exposure_snapshot();
+
+    CHECK(exposure.total_exposure == 0.0, "Exposure released");
+
+    hft::arbitrage::ArbRiskContext stale_ctx = ctx;
+    stale_ctx.buy_quote_ts_ns = now - 2'000'000'000ULL;
+
+    auto stale = guard.check(plan, stale_ctx);
+
+    CHECK(
+        stale.decision == hft::arbitrage::ArbRiskDecision::Rejected,
+        "Stale quote rejected"
+    );
+
+    CHECK(
+        stale.code == hft::arbitrage::ArbRejectCode::StaleQuote,
+        "Stale quote reject code"
+    );
+
+    guard.set_kill_switch(true);
+
+    auto rejected = guard.check(plan, ctx);
+
+    CHECK(
+        rejected.decision == hft::arbitrage::ArbRiskDecision::Rejected,
+        "Kill switch rejected"
+    );
+
+    CHECK(
+        rejected.code == hft::arbitrage::ArbRejectCode::KillSwitch,
+        "Kill switch reject code"
+    );
+
+    CHECK(guard.metrics().checks.load() >= 3, "Risk checks metric");
+    CHECK(guard.metrics().approved.load() == 1, "Risk approved metric");
+    CHECK(guard.metrics().stale_quotes.load() == 1, "Stale quote metric");
+    CHECK(guard.metrics().kill_switch_rejects.load() == 1, "Kill switch metric");
+}
+
+
+void test_arbitrage_executor_emergency_hedge() {
+    hft::arbitrage::ArbitrageOpportunity opp;
+    opp.symbol = "BTC-USDT";
+    opp.buy_venue = "BINANCE";
+    opp.sell_venue = "OKX";
+    opp.buy_price = 101.0;
+    opp.sell_price = 104.0;
+    opp.quantity = 2.0;
+    opp.net_edge_bps = 290.0;
+    opp.expected_profit = 6.0;
+
+    hft::arbitrage::ArbitrageExecutionPlanner planner;
+    auto plan = planner.build_plan(opp);
+
+    hft::arbitrage::ArbExecutorConfig config;
+    config.max_leg_imbalance_qty = 0.000001;
+
+    hft::arbitrage::ArbitrageExecutor executor(config);
+
+    auto submissions = executor.submit_plan(plan);
+
+    CHECK(submissions.size() == 2, "Emergency hedge test creates two submissions");
+
+    const uint64_t plan_id = submissions[0].plan_id;
+
+    executor.on_report({
+        plan_id,
+        true,
+        hft::arbitrage::ArbExecReportType::Ack,
+        0.0,
+        0.0,
+        ""
+    });
+
+    executor.on_report({
+        plan_id,
+        false,
+        hft::arbitrage::ArbExecReportType::Ack,
+        0.0,
+        0.0,
+        ""
+    });
+
+    executor.on_report({
+        plan_id,
+        true,
+        hft::arbitrage::ArbExecReportType::Fill,
+        2.0,
+        101.0,
+        ""
+    });
+
+    executor.on_report({
+        plan_id,
+        false,
+        hft::arbitrage::ArbExecReportType::Reject,
+        0.0,
+        0.0,
+        "Venue rejected sell leg"
+    });
+
+    auto record = executor.record(plan_id);
+
+    CHECK(record.has_value(), "Emergency hedge record exists");
+
+    CHECK(
+        record->state == hft::arbitrage::ArbExecutorState::EmergencyHedgeRequired,
+        "Emergency hedge required after one-leg fill and opposite reject"
+    );
+
+    CHECK(
+        record->emergency_hedge.has_value(),
+        "Emergency hedge request generated"
+    );
+
+    CHECK(
+        record->emergency_hedge->side == hft::arbitrage::ArbLegSide::Sell,
+        "Emergency hedge side is sell"
+    );
+
+    CHECK(
+        record->emergency_hedge->quantity == 2.0,
+        "Emergency hedge quantity equals exposed buy fill"
+    );
+
+    CHECK(
+        record->emergency_hedge->symbol == "BTC-USDT",
+        "Emergency hedge symbol tracked"
+    );
+
+    CHECK(
+        executor.metrics().rejects.load() == 1,
+        "Executor reject metric updated"
+    );
+
+    CHECK(
+        executor.metrics().emergency_hedges.load() == 1,
+        "Executor emergency hedge metric updated"
+    );
+
+    executor.on_report({
+        plan_id,
+        false,
+        hft::arbitrage::ArbExecReportType::Reject,
+        0.0,
+        0.0,
+        "Duplicate reject"
+    });
+
+    auto record_after_duplicate = executor.record(plan_id);
+
+    CHECK(
+        record_after_duplicate->emergency_hedge.has_value(),
+        "Emergency hedge remains after duplicate reject"
+    );
+
+    CHECK(
+        executor.metrics().emergency_hedges.load() == 1,
+        "Emergency hedge is idempotent"
+    );
+}
+
+
+void test_integrated_arbitrage_pipeline() {
+    using namespace hft::arbitrage;
+
+    ArbitrageConfig arb_config;
+    arb_config.min_net_edge_bps = 3.0;
+    arb_config.safety_slippage_bps = 1.0;
+
+    CrossExchangeArbitrageEngine detector(arb_config);
+
+    detector.update_market({"BINANCE", "BTC-USDT", 100.0, 101.0, 10.0, 10.0, 1.0, 100.0, true});
+    detector.update_market({"OKX", "BTC-USDT", 104.0, 105.0, 8.0, 8.0, 1.0, 120.0, true});
+
+    auto opportunity = detector.best_opportunity("BTC-USDT");
+
+    CHECK(opportunity.has_value(), "Pipeline opportunity detected");
+    CHECK(opportunity.has_value(), "Pipeline opportunity executable");
+
+    ArbExecutionConfig exec_config;
+    exec_config.max_notional = 1e12;
+    exec_config.min_expected_profit = 1.0;
+    exec_config.hedge_policy = HedgePolicy::ImmediateBothLegs;
+
+    ArbitrageExecutionPlanner planner(exec_config);
+    auto plan = planner.build_plan(*opportunity);
+
+    CHECK(plan.state == ExecutionPlanState::Ready, "Pipeline execution plan ready");
+
+    ArbRiskConfig risk_config;
+    risk_config.max_plan_notional = 1e12;
+    risk_config.max_symbol_exposure = 1e12;
+    risk_config.max_venue_exposure = 1e12;
+    risk_config.max_quote_age_ns = 5'000'000'000ULL;
+    risk_config.max_venue_concentration = 1.0;
+
+    ArbitrageRiskGuard guard(risk_config);
+
+    const uint64_t now = 20'000'000'000ULL;
+
+    ArbRiskContext ctx;
+    ctx.now_ns = now;
+    ctx.buy_quote_ts_ns = now - 1000;
+    ctx.sell_quote_ts_ns = now - 1000;
+    ctx.current_symbol_exposure = 0.0;
+    ctx.current_buy_venue_exposure = 0.0;
+    ctx.current_sell_venue_exposure = 0.0;
+    ctx.total_portfolio_exposure = 0.0;
+    ctx.inventory_base = 0.0;
+    ctx.inventory_quote = 0.0;
+    ctx.realized_pnl_today = 0.0;
+    ctx.unrealized_pnl = 0.0;
+
+    auto risk = guard.check(plan, ctx);
+
+    std::cout << "Pipeline risk decision: "
+              << risk.reason
+              << std::endl;
+
+    CHECK(risk.decision == ArbRiskDecision::Approved, "Pipeline risk approved");
+
+    ArbExecutorConfig executor_config;
+    executor_config.max_leg_imbalance_qty = 0.000001;
+
+    ArbitrageExecutor executor(executor_config);
+
+    auto submissions = executor.submit_plan(plan);
+
+    CHECK(submissions.size() == 2, "Pipeline produced two submissions");
+    CHECK(submissions[0].plan_id == submissions[1].plan_id, "Pipeline shared plan id");
+
+    const auto plan_id = submissions[0].plan_id;
+
+    CHECK(submissions[0].venue == "BINANCE", "Pipeline buy venue");
+    CHECK(submissions[1].venue == "OKX", "Pipeline sell venue");
+
+    CHECK(submissions[0].side == ArbLegSide::Buy, "Pipeline first submission buy");
+    CHECK(submissions[1].side == ArbLegSide::Sell, "Pipeline second submission sell");
+
+    executor.on_report({plan_id, true, ArbExecReportType::Ack, 0.0, 0.0, ""});
+    executor.on_report({plan_id, false, ArbExecReportType::Ack, 0.0, 0.0, ""});
+
+    executor.on_report({
+        plan_id,
+        true,
+        ArbExecReportType::Fill,
+        submissions[0].quantity,
+        submissions[0].price,
+        ""
+    });
+
+    executor.on_report({
+        plan_id,
+        false,
+        ArbExecReportType::Fill,
+        submissions[1].quantity,
+        submissions[1].price,
+        ""
+    });
+
+    auto record = executor.record(plan_id);
+
+    CHECK(record.has_value(), "Pipeline execution record exists");
+    CHECK(record->state == ArbExecutorState::Completed, "Pipeline execution completed");
+
+    CHECK(detector.metrics().scans.load() >= 1, "Pipeline detector metrics");
+    CHECK(planner.metrics().plans_ready.load() == 1, "Pipeline planner metrics");
+    CHECK(guard.metrics().approved.load() == 1, "Pipeline risk metrics");
+    CHECK(executor.metrics().plans_completed.load() == 1, "Pipeline executor metrics");
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1163,6 +1719,12 @@ int main() {
     test_market_maker();
     test_event_recorder();
     test_execution_engine();
+    test_advanced_cross_exchange_arbitrage_engine();
+    test_arbitrage_execution_planner();
+    test_arbitrage_risk_guard();
+    test_arbitrage_executor();
+    test_arbitrage_executor_emergency_hedge();
+    test_integrated_arbitrage_pipeline();
 
     std::cout << "\n==================================================\n";
     std::cout << " Results: " << g_pass << " passed, " << g_fail << " failed\n";

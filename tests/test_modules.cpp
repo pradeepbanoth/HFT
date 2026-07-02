@@ -4,6 +4,7 @@
 
 #include "../include/hft.hpp"
 #include "oms_reconciler.hpp"
+#include "exchange_bus.hpp"
 #include <iostream>
 #include <iomanip>
 #include <cassert>
@@ -11,6 +12,16 @@
 #include <chrono>
 #include <sstream>
 #include <thread>
+#include <thread>
+#include <chrono>
+#include <unordered_map>
+#include <algorithm>
+#include <atomic>
+#include <mutex>
+#include <thread>
+#include <vector>
+#include <cstdlib>
+
 
 using namespace hft;
 
@@ -1511,6 +1522,656 @@ void test_binance_adapter() {
 }
 
 
+void test_exchange_transport() {
+    SUITE("ExchangeTransport");
+
+    hft::transport::TransportConfig cfg;
+    cfg.venue = "binance";
+    cfg.paper_mode = true;
+    cfg.rest_rate_limit_per_sec = 1000;
+    cfg.ws_rate_limit_per_sec = 1000;
+    cfg.heartbeat_interval_ms = 100;
+    cfg.heartbeat_timeout_ms = 1000;
+
+    hft::transport::ExchangeTransport tr(cfg);
+
+    int state_events = 0;
+    int rest_callbacks = 0;
+    int ws_callbacks = 0;
+    int heartbeats = 0;
+
+    hft::transport::TransportCallbacks cb;
+
+    cb.on_state = [&](hft::transport::TransportState) {
+        state_events++;
+    };
+
+    cb.on_rest_response = [&](const hft::transport::RestResponse& r) {
+        rest_callbacks++;
+        CHECK(r.ok, "REST callback response OK");
+    };
+
+    cb.on_ws_message = [&](const hft::transport::WsMessage& m) {
+        ws_callbacks++;
+        CHECK(m.channel == "btcusdt@trade", "WS channel correct");
+        CHECK(!m.payload.empty(), "WS payload non-empty");
+    };
+
+    cb.on_heartbeat = [&]() {
+        heartbeats++;
+    };
+
+    cb.auth_headers = [] {
+        return std::unordered_map<std::string, std::string>{
+            {"X-API-KEY", "paper-key"}
+        };
+    };
+
+    tr.set_callbacks(cb);
+
+    CHECK(tr.connect(), "Transport connects");
+    CHECK(tr.authenticated(), "Transport authenticated");
+    CHECK(state_events >= 3, "State callbacks fired");
+
+    hft::transport::RestRequest req;
+    req.method = hft::transport::RestMethod::GET;
+    req.path = "/api/v3/account";
+    req.requires_auth = true;
+    req.priority = hft::transport::RequestPriority::High;
+
+    auto res = tr.send_rest_sync(req);
+    CHECK(res.ok, "Synchronous REST OK");
+    CHECK(res.status == 200, "Synchronous REST status 200");
+
+    hft::transport::RestRequest async_req;
+    async_req.method = hft::transport::RestMethod::POST;
+    async_req.path = "/api/v3/order";
+    async_req.body = "{}";
+    async_req.requires_auth = true;
+    async_req.priority = hft::transport::RequestPriority::Critical;
+    async_req.callback = [&](const hft::transport::RestResponse& r) {
+        CHECK(r.ok, "Async REST callback OK");
+    };
+
+    int64_t rid = tr.send_rest(async_req);
+    CHECK(rid > 0, "Async REST request id assigned");
+
+    CHECK(tr.subscribe("btcusdt@trade"), "WS subscribe works");
+    CHECK(tr.subscribe("btcusdt@depth20@100ms"), "WS second subscribe works");
+
+    auto subs = tr.subscriptions();
+    CHECK(subs.size() >= 2, "Subscriptions stored");
+
+    tr.inject_ws_message("btcusdt@trade", R"({"p":"43000.0","q":"0.1"})");
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+    CHECK(rest_callbacks >= 1, "Async REST callback fired");
+    CHECK(ws_callbacks >= 1, "WS callback fired");
+    CHECK(heartbeats >= 1, "Heartbeat callback fired");
+
+    auto m = tr.metrics();
+    CHECK(m.rest_sent >= 1, "REST sent metric updated");
+    CHECK(m.rest_ok >= 1, "REST OK metric updated");
+    CHECK(m.ws_sent >= 2, "WS sent metric updated");
+    CHECK(m.ws_received >= 1, "WS received metric updated");
+    CHECK(m.ws_subscriptions >= 2, "WS subscription metric updated");
+
+    CHECK(tr.unsubscribe("btcusdt@trade"), "WS unsubscribe works");
+
+    tr.disconnect();
+    CHECK(
+        tr.state() == hft::transport::TransportState::Disconnected,
+        "Transport disconnected"
+    );
+}
+
+
+void test_exchange_bus_advanced() {
+    using namespace hft::exchange;
+
+    auto ASSERT_TRUE = [](bool condition, const char* message) {
+    if (condition) {
+        std::cout << "  PASS: " << message << "\n";
+    } else {
+        std::cout << "  FAIL: " << message << "\n";
+    }
+};
+
+    ExchangeBusConfig config;
+    config.high_capacity = 4;
+    config.normal_capacity = 4;
+    config.low_capacity = 4;
+    config.backpressure = BackpressurePolicy::DropOldest;
+    config.record_events = true;
+
+    ExchangeBus bus(config);
+
+    int recorded = 0;
+    int received = 0;
+    int filtered_received = 0;
+
+    bus.set_recorder_hook([&](const IExchangeBusEvent&) {
+        recorded++;
+    });
+
+    bus.start();
+
+    auto sub1 = bus.subscribe<L1Update>(
+        ExchangeEventType::L1Update,
+        [&](const ExchangeEventHeader& header, const L1Update& event) {
+            received++;
+            ASSERT_TRUE(header.id > 0, "Event id assigned");
+            ASSERT_TRUE(header.type == ExchangeEventType::L1Update, "Correct event type");
+            ASSERT_TRUE(event.symbol == "BTC-USDT", "Received BTC-USDT");
+        },
+        "all-l1"
+    );
+
+    auto sub2 = bus.subscribe_filtered<L1Update>(
+        ExchangeEventType::L1Update,
+        [](const ExchangeEventHeader&, const L1Update& event) {
+            return event.bid > 100.0;
+        },
+        [&](const ExchangeEventHeader&, const L1Update&) {
+            filtered_received++;
+        },
+        "filtered-l1"
+    );
+
+    ASSERT_TRUE(sub1 > 0, "Normal subscription created");
+    ASSERT_TRUE(sub2 > 0, "Filtered subscription created");
+
+    bool ok1 = bus.publish(
+        ExchangeEventType::L1Update,
+        L1Update{"BTC-USDT", 99.0, 100.0, 1.0, 1.5},
+        EventPriority::High
+    );
+
+    bool ok2 = bus.publish(
+        ExchangeEventType::L1Update,
+        L1Update{"BTC-USDT", 101.0, 102.0, 2.0, 2.5},
+        EventPriority::High
+    );
+
+    ASSERT_TRUE(ok1, "First publish accepted");
+    ASSERT_TRUE(ok2, "Second publish accepted");
+
+    auto dispatched_events = bus.dispatch_batch(16);
+
+    ASSERT_TRUE(dispatched_events == 2, "Two events dispatched from queue");
+    ASSERT_TRUE(received == 2, "Base subscriber received two events");
+    ASSERT_TRUE(filtered_received == 1, "Filtered subscriber received one event");
+    ASSERT_TRUE(recorded == 2, "Recorder hook captured two events");
+
+    ASSERT_TRUE(bus.stats().published.load() == 2, "Published metric updated");
+    ASSERT_TRUE(bus.stats().dispatched.load() == 3, "Dispatch callback metric updated");
+    ASSERT_TRUE(bus.stats().high_depth.load() == 0, "High queue drained");
+
+    bus.stop();
+
+    ASSERT_TRUE(bus.state() == BusState::Stopped, "Bus stopped cleanly");
+}
+
+
+void test_lock_free_ring_buffer_stress() {
+    using namespace hft::exchange;
+
+    auto check = [](bool condition, const char* message) {
+        if (!condition) {
+            std::cerr << "  FAIL: " << message << '\n';
+            std::exit(1);
+        }
+
+        std::cout << "  PASS: " << message << '\n';
+    };
+
+    constexpr int producers = 4;
+    constexpr int consumers = 4;
+    constexpr int per_producer = 25000;
+    constexpr int total = producers * per_producer;
+
+    LockFreeRingBuffer<int, 65536> ring;
+
+    std::atomic<int> produced{0};
+    std::atomic<int> consumed{0};
+    std::atomic<bool> producers_done{false};
+
+    std::vector<int> results;
+    std::mutex results_mutex;
+
+    std::vector<std::thread> producer_threads;
+    std::vector<std::thread> consumer_threads;
+
+    for (int p = 0; p < producers; ++p) {
+        producer_threads.emplace_back([&, p]() {
+            const int base = p * per_producer;
+
+            for (int i = 0; i < per_producer; ++i) {
+                const int value = base + i;
+
+                while (!ring.try_push(value)) {
+                    std::this_thread::yield();
+                }
+
+                produced.fetch_add(1, std::memory_order_relaxed);
+            }
+        });
+    }
+
+    for (int c = 0; c < consumers; ++c) {
+        consumer_threads.emplace_back([&]() {
+            int value = 0;
+
+            while (!producers_done.load(std::memory_order_acquire) ||
+                   consumed.load(std::memory_order_relaxed) < total) {
+                if (ring.try_pop(value)) {
+                    {
+                        std::scoped_lock lock(results_mutex);
+                        results.push_back(value);
+                    }
+
+                    consumed.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    std::this_thread::yield();
+                }
+            }
+        });
+    }
+
+    for (auto& t : producer_threads) {
+        t.join();
+    }
+
+    producers_done.store(true, std::memory_order_release);
+
+    for (auto& t : consumer_threads) {
+        t.join();
+    }
+
+    check(produced.load() == total, "Stress produced all events");
+    check(consumed.load() == total, "Stress consumed all events");
+    check(results.size() == static_cast<size_t>(total), "Stress result size correct");
+
+    std::sort(results.begin(), results.end());
+
+    bool ordered_unique = true;
+
+    for (int i = 0; i < total; ++i) {
+        if (results[static_cast<size_t>(i)] != i) {
+            ordered_unique = false;
+            break;
+        }
+    }
+
+    check(ordered_unique, "Stress no lost or duplicate events");
+    check(ring.empty(), "Stress ring empty at end");
+    check(ring.pushes() == static_cast<uint64_t>(total), "Stress push metric correct");
+    check(ring.pops() == static_cast<uint64_t>(total), "Stress pop metric correct");
+}
+
+
+void test_exchange_bus_lock_free_channels() {
+    using namespace hft::exchange;
+
+    ExchangeBus bus;
+    bus.start();
+
+    std::vector<std::string> received;
+
+    bus.subscribe<L1Update>(
+        ExchangeEventType::L1Update,
+        [&](const ExchangeEventHeader&, const L1Update& event) {
+            received.push_back(event.symbol);
+        },
+        "priority-test"
+    );
+
+    bus.publish(
+        ExchangeEventType::L1Update,
+        L1Update{"LOW", 1, 2, 1, 1},
+        EventPriority::Low
+    );
+
+    bus.publish(
+        ExchangeEventType::L1Update,
+        L1Update{"HIGH", 1, 2, 1, 1},
+        EventPriority::High
+    );
+
+    bus.publish(
+        ExchangeEventType::L1Update,
+        L1Update{"NORMAL", 1, 2, 1, 1},
+        EventPriority::Normal
+    );
+
+    auto dispatched = bus.dispatch_batch();
+
+    CHECK(dispatched == 3, "Batch dispatched three events");
+    CHECK(received.size() == 3, "Received three events");
+    CHECK(received[0] == "HIGH", "High priority dispatched first");
+    CHECK(received[1] == "NORMAL", "Normal priority dispatched second");
+    CHECK(received[2] == "LOW", "Low priority dispatched third");
+
+    CHECK(bus.stats().published.load() == 3, "Published metric updated");
+    CHECK(bus.stats().dispatched.load() == 3, "Dispatched metric updated");
+
+    bus.stop();
+}
+
+
+void test_exchange_dispatcher_advanced() {
+    using namespace hft::exchange;
+
+    ExchangeBus bus;
+    bus.start();
+
+    std::atomic<int> received{0};
+    std::atomic<int> affinity_calls{0};
+    std::atomic<int> errors{0};
+
+    bus.subscribe<L1Update>(
+        ExchangeEventType::L1Update,
+        [&](const ExchangeEventHeader&, const L1Update&) {
+            received.fetch_add(1, std::memory_order_relaxed);
+        },
+        "advanced-dispatcher-sub"
+    );
+
+    DispatcherConfig config;
+    config.worker_count = 2;
+    config.batch_size = 128;
+    config.idle_sleep = std::chrono::microseconds(10);
+    config.drain_on_stop = true;
+    config.stop_drain_timeout = std::chrono::milliseconds(1000);
+
+    ExchangeDispatcher<ExchangeBus> dispatcher(
+        bus,
+        config,
+        [&](std::size_t) {
+            affinity_calls.fetch_add(1, std::memory_order_relaxed);
+        },
+        [&](std::size_t, const std::exception&) {
+            errors.fetch_add(1, std::memory_order_relaxed);
+        }
+    );
+
+   CHECK(dispatcher.start(), "Advanced dispatcher starts");
+   CHECK(dispatcher.running(), "Advanced dispatcher running");
+   CHECK(dispatcher.worker_count() == 2, "Worker count correct");
+
+    for (int i = 0; i < 5000; ++i) {
+             CHECK(
+            bus.publish(
+                ExchangeEventType::L1Update,
+                L1Update{"BTC-USDT", 100.0, 101.0, 1.0, 1.0},
+                EventPriority::Normal
+            ),
+            "Publish dispatcher event"
+        );
+    }
+
+    for (int i = 0; i < 200 && received.load() < 5000; ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+
+    CHECK(dispatcher.pause(), "Dispatcher pauses");
+    CHECK(dispatcher.paused(), "Dispatcher paused");
+
+    CHECK(dispatcher.resume(), "Dispatcher resumes");
+    CHECK(dispatcher.running(), "Dispatcher resumed");
+
+    dispatcher.stop();
+
+    CHECK(dispatcher.state() == DispatcherState::Stopped, "Advanced dispatcher stopped");
+    CHECK(received.load() == 5000, "All events dispatched");
+    CHECK(dispatcher.stats().total_events.load() >= 5000, "Total event metric updated");
+    CHECK(dispatcher.stats().total_batches.load() > 0, "Batch metric updated");
+    CHECK(affinity_calls.load() == 2, "Affinity hook called per worker");
+    CHECK(errors.load() == 0, "No dispatcher errors");
+
+   CHECK(
+        dispatcher.worker_stats(0).loops.load() > 0 ||
+        dispatcher.worker_stats(1).loops.load() > 0,
+        "Worker loop metrics updated"
+    );
+
+    bus.stop();
+}
+
+
+void test_exchange_bus_advanced_metrics() {
+    using namespace hft::exchange;
+
+    ExchangeBus bus;
+    bus.start();
+
+    bus.set_slow_consumer_threshold_ns(1);
+
+    std::atomic<int> received{0};
+
+    bus.subscribe<L1Update>(
+        ExchangeEventType::L1Update,
+        [&](const ExchangeEventHeader&, const L1Update&) {
+            received.fetch_add(1, std::memory_order_relaxed);
+            std::this_thread::sleep_for(std::chrono::microseconds(10));
+        },
+        "advanced-metrics-sub"
+    );
+
+    for (int i = 0; i < 100; ++i) {
+        CHECK(
+            bus.publish(
+                ExchangeEventType::L1Update,
+                L1Update{"BTC-USDT", 100.0, 101.0, 1.0, 1.0},
+                i % 2 == 0 ? EventPriority::High : EventPriority::Normal
+            ),
+            "Publish advanced metric event"
+        );
+    }
+
+    auto before = bus.metrics_snapshot();
+
+    CHECK(before.published == 100, "Advanced metrics published");
+    CHECK(before.total_depth == 100, "Advanced queue depth");
+    CHECK(before.max_queue_depth_seen >= 100, "Max depth tracked");
+
+    auto dispatched = bus.dispatch_once(100);
+
+    CHECK(dispatched == 100, "Advanced metrics dispatch count");
+    CHECK(received.load() == 100, "Advanced subscriber count");
+
+    auto after = bus.metrics_snapshot();
+
+    CHECK(after.dispatched == 100, "Advanced dispatched metric");
+    CHECK(after.total_depth == 0, "Queue drained");
+    CHECK(after.publish_latency.count == 100, "Publish histogram count");
+    CHECK(after.dispatch_latency.count == 100, "Dispatch histogram count");
+    CHECK(after.consumer_latency.count == 100, "Consumer histogram count");
+    CHECK(after.consumer_latency.p50_ns > 0, "Consumer p50 tracked");
+    CHECK(after.consumer_latency.p90_ns > 0, "Consumer p90 tracked");
+    CHECK(after.consumer_latency.p99_ns > 0, "Consumer p99 tracked");
+    CHECK(after.slow_consumers >= 1, "Slow consumers tracked");
+
+    bus.stop();
+
+    CHECK(
+        !bus.publish(
+            ExchangeEventType::L1Update,
+            L1Update{"BTC-USDT", 1.0, 2.0, 1.0, 1.0}
+        ),
+        "Reject publish after stop"
+    );
+
+    auto stopped = bus.metrics_snapshot();
+
+    CHECK(stopped.rejected_not_running >= 1, "Rejected not running metric");
+}
+
+
+void test_bybit_adapter() {
+    SUITE("BybitAdapter");
+
+    OrderManager oms;
+    PortfolioState portfolio(100000.0);
+
+    RiskGateway risk;
+    SymbolRiskLimits sym_lim;
+    sym_lim.max_position = 10.0;
+    sym_lim.max_order_qty = 5.0;
+    sym_lim.max_order_notional = 1'000'000.0;
+    sym_lim.max_price_deviation_bps = 500.0;
+    sym_lim.tick_size = 0.01;
+    sym_lim.lot_size = 0.001;
+    sym_lim.max_orders_per_second = 100;
+    risk.set_symbol_limits("BTCUSDT", sym_lim);
+
+    PaperExchangeGateway gateway("bybit", &oms, &risk, &portfolio);
+
+    OrderBook book("BTCUSDT", 0.01);
+    book.apply_l2({"BTCUSDT", BookSide::Bid, 43000.0, 2.0, 1000, 1});
+    book.apply_l2({"BTCUSDT", BookSide::Ask, 43001.0, 2.0, 1001, 2});
+    gateway.update_book("BTCUSDT", &book);
+
+    BybitAdapterConfig cfg;
+    cfg.category = BybitCategory::Linear;
+    cfg.position_mode = BybitPositionMode::OneWay;
+    cfg.paper_mode = true;
+
+    BybitAdapter adapter(cfg, &gateway, &oms);
+
+    int book_updates = 0;
+    int trades = 0;
+    int acks = 0;
+    int fills = 0;
+    int cancels = 0;
+    int errors = 0;
+    int heartbeats = 0;
+
+    AdapterCallbacks cb;
+    cb.on_book = [&](const L2Update& u) {
+        ++book_updates;
+        CHECK(u.symbol == "BTCUSDT", "Bybit book symbol normalized");
+    };
+    cb.on_trade = [&](const Trade& t) {
+        ++trades;
+        CHECK(t.symbol == "BTCUSDT", "Bybit trade symbol normalized");
+    };
+    cb.on_ack = [&](const Order&, bool accepted) {
+        ++acks;
+        CHECK(accepted, "Bybit ACK accepted");
+    };
+    cb.on_fill = [&](const FillEvent& f) {
+        ++fills;
+        CHECK(f.symbol == "BTCUSDT", "Bybit fill symbol normalized");
+    };
+    cb.on_cancel = [&](const std::string&) {
+        ++cancels;
+    };
+    cb.on_error = [&](const AdapterErrorEvent&) {
+        ++errors;
+    };
+    cb.on_heartbeat = [&]() {
+        ++heartbeats;
+    };
+
+    adapter.set_callbacks(cb);
+
+    CHECK(adapter.connect(), "Bybit adapter connects");
+    CHECK(adapter.is_connected(), "Bybit adapter connected");
+    CHECK(adapter.authenticated(), "Bybit adapter authenticated in paper mode");
+
+    CHECK(adapter.subscribe_orderbook("BTC-USDT", 50), "Bybit subscribe orderbook");
+    CHECK(adapter.subscribe_trades("BTC/USDT"), "Bybit subscribe trades");
+    CHECK(adapter.subscribe_ticker("BTCUSDT"), "Bybit subscribe ticker");
+    CHECK(adapter.subscriptions().size() == 3, "Bybit has 3 subscriptions");
+
+    CHECK(adapter.unsubscribe("BTCUSDT"), "Bybit unsubscribe removes subscriptions");
+    CHECK(adapter.subscriptions().empty(), "Bybit subscriptions empty after unsubscribe");
+
+    Order order;
+    order.symbol = "BTC-USDT";
+    order.side = Side::Buy;
+    order.price = 43000.0;
+    order.qty = 0.01;
+    order.order_type = OrderType::PostOnly;
+    order.client_id = "bybit-c1";
+    order.timestamp = 2000;
+
+    BybitOrderOptions opt;
+    opt.tif = BybitTimeInForce::PostOnly;
+    opt.position_idx = 0;
+
+    auto ack = adapter.submit_order(order, opt);
+    CHECK(ack.accepted, "Bybit order accepted");
+    CHECK(acks == 1, "Bybit ACK callback fired");
+    CHECK(adapter.open_orders("BTCUSDT").size() == 1, "Bybit open_orders has one order");
+
+    std::string oid = ack.order_id;
+
+    auto rep = adapter.replace_order(oid, 42999.0, 0.02);
+    CHECK(rep.accepted, "Bybit replace accepted");
+
+    FillEvent fill;
+    fill.order_id = oid;
+    fill.symbol = "BTC-USDT";
+    fill.side = Side::Buy;
+    fill.price = 42999.0;
+    fill.qty = 0.02;
+    fill.timestamp = 3000;
+    fill.is_maker = true;
+
+    adapter.inject_fill(fill);
+    CHECK(fills == 1, "Bybit fill callback fired");
+    CHECK(!adapter.fills().empty(), "Bybit stores fills");
+
+    auto cancel_ack = adapter.cancel_order(oid);
+    CHECK(cancel_ack.accepted || cancel_ack.reject_code == GatewayRejectCode::UnknownOrder,
+          "Bybit cancel after fill handled");
+
+    adapter.inject_book_update({"BTC-USDT", BookSide::Bid, 43010.0, 1.0, 4000, 10});
+    adapter.inject_book_update({"BTC-USDT", BookSide::Bid, 43011.0, 1.0, 4001, 12});
+    CHECK(book_updates == 2, "Bybit book callbacks fired");
+    CHECK(adapter.metrics().sequence_gaps == 1, "Bybit sequence gap detected");
+
+    adapter.inject_trade({"t1", "BTC/USDT", Side::Buy, 43001.0, 0.1, 5000, Side::Buy, false});
+    CHECK(trades == 1, "Bybit trade callback fired");
+
+    adapter.update_balance("USDT", 10000.0);
+    adapter.update_position("BTCUSDT", 0.5);
+    CHECK(adapter.balances().at("USDT") == 10000.0, "Bybit balance updated");
+    CHECK(adapter.positions().at("BTCUSDT") == 0.5, "Bybit position updated");
+
+    CHECK(adapter.set_position_mode(BybitPositionMode::Hedge), "Bybit set hedge mode");
+    CHECK(adapter.position_mode() == BybitPositionMode::Hedge, "Bybit hedge mode stored");
+
+    CHECK(BybitAdapter::normalize_to_internal("btc-usdt") == "BTCUSDT", "Bybit symbol normalize dash");
+    CHECK(BybitAdapter::normalize_to_internal("btc/usdt") == "BTCUSDT", "Bybit symbol normalize slash");
+    CHECK(BybitAdapter::category_to_str(BybitCategory::Linear) == "linear", "Bybit category string");
+    CHECK(BybitAdapter::translate_bybit_error(10006) == AdapterError::RateLimited, "Bybit error rate limit");
+    CHECK(BybitAdapter::translate_bybit_error(110001) == AdapterError::OrderNotFound, "Bybit error order not found");
+
+    adapter.heartbeat();
+    CHECK(heartbeats == 1, "Bybit heartbeat callback fired");
+
+    adapter.disconnect();
+    CHECK(!adapter.is_connected(), "Bybit disconnected");
+
+    Order bad;
+    bad.symbol = "BTCUSDT";
+    bad.side = Side::Buy;
+    bad.price = 43000.0;
+    bad.qty = 0.01;
+    bad.order_type = OrderType::Limit;
+    bad.client_id = "bybit-c2";
+
+    auto bad_ack = adapter.submit_order(bad);
+    CHECK(!bad_ack.accepted, "Bybit submit rejected while disconnected");
+    CHECK(errors >= 1, "Bybit error callback fired");
+}
+
+
+
 // ─────────────────────────────────────────────────────────────────────────────
 // main
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1532,6 +2193,13 @@ int main() {
     test_exchange_adapter();
     test_websocket_engine();
     test_binance_adapter();
+    test_exchange_transport();
+    test_exchange_bus_advanced();
+    test_lock_free_ring_buffer_stress();
+    test_exchange_bus_lock_free_channels();
+    test_exchange_dispatcher_advanced();
+    test_exchange_bus_advanced_metrics();
+    test_bybit_adapter();
     test_session_manager();
     test_full_integration();
     test_oms_reconciler();
